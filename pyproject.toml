@@ -22,7 +22,8 @@ dependencies = [
     "redis>=5",               # health windows, breaker state, stream queue, idempotency, §5.5
     "prometheus-client",      # metrics exporter, FR-3.3 / §6 metrics catalogue
     "structlog",              # structured logs correlated by request_id, FR-7.3
-    "httpx",                  # async HTTP for the mock provider service, §5.3
+    "httpx",                  # LiteLLM transport and FastAPI TestClient. The mock needs no
+                              # HTTP at all — it is in-process (ADR 0002).
 ]
 
 [project.optional-dependencies]

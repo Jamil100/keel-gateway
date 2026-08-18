@@ -5,18 +5,18 @@
 **Last updated:** 2026-08-18
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 1.0h of 21.0h. ✅ P1-T1 · ⬜ P1-T2 … P2-T6. Next up: **P1-T2 — request envelope and header validation.**
+**Progress:** 3.25h of 21.75h. ✅ P1-T1 · ✅ P1-T2 · ⬜ P1-T3 … P2-T6. Next up: **P1-T3 — provider adapter protocol and error taxonomy skeleton.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`.
 
 Not yet built: FastAPI ingress, provider adapters, router, health tracking, metrics, the compose stack.
 
-This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~21h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
+This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~21.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
 
 Three Phase 0 exit items never landed and are folded in, sized at ~1.5h total:
 
@@ -57,14 +57,16 @@ Adapters return a `ProviderResult` and know nothing about Redis. The executor is
 
 **Done when:** ~~`ManualClock` unit tests pass and CI is green on the existing `test_config.py`.~~ ✅ Met — 36 tests. Local runs need `pip install -e ".[dev]"` first; without `pytest-asyncio` the seven async clock tests error out on collection.
 
-### P1-T2 — Request envelope and header validation
-**1.5h · FR-1.2, FR-1.3, FR-1.4, FR-1.5**
+### ~~P1-T2 — Request envelope and header validation~~ ✅ **DONE**
+**2.25h (est. 1.5h) · FR-1.2, FR-1.3, FR-1.4, FR-1.5**
 
-- `keel/api/envelope.py` — `RequestEnvelope` exactly as technical design §5.1: `request_id`, `tenant`, `feature`, `request_class`, `capabilities: frozenset[str]`, `deferrable`, `idempotency_key`, `payload`, `received_at` (from the injected clock, never `time.time()`).
-- Parse from the `X-Keel-*` headers in §5.1. `request_class` must exist in `KeelConfig.request_classes`; `deferrable` is **derived from that class's config, not taken from the client**. `X-Keel-Idempotency-Key` is required when the class is deferrable.
-- `keel/api/errors.py` — one machine-readable error body used by every 4xx/5xx, listing the offending fields. Collect *all* missing fields in one response, not the first — a client fixing headers one round-trip at a time is a bad first impression of the gateway.
+The 0.75h overrun is the request-body extension field. §5.1 calls for it as a fallback for clients that cannot set headers, but never named it and this task bullet never listed it; building it now rather than leaving §5.1 half-implemented cost precedence rules, payload stripping, and a second test table. Phase 1 is now budgeted at 10.75h.
 
-**Done when:** table-driven tests cover every required header missing individually and in combination, an unknown `request_class`, and a deferrable class with no idempotency key.
+- ~~`keel/api/envelope.py` — `RequestEnvelope` exactly as technical design §5.1: `request_id`, `tenant`, `feature`, `request_class`, `capabilities: frozenset[str]`, `deferrable`, `idempotency_key`, `payload`, `received_at` (from the injected clock, never `time.time()`).~~ ✅
+- ~~Parse from the `X-Keel-*` headers in §5.1. `request_class` must exist in `KeelConfig.request_classes`; `deferrable` is **derived from that class's config, not taken from the client**. `X-Keel-Idempotency-Key` is required when the class is deferrable.~~ ✅ Plus the `x_keel` body fallback: header wins on conflict, unknown keys rejected (so a client cannot claim `deferrable`), and the object is stripped from the provider-bound payload.
+- ~~`keel/api/errors.py` — one machine-readable error body used by every 4xx/5xx, listing the offending fields. Collect *all* missing fields in one response, not the first — a client fixing headers one round-trip at a time is a bad first impression of the gateway.~~ ✅ OpenAI error envelope with a nested `keel` extension — **ADR 0003**.
+
+**Done when:** ~~table-driven tests cover every required header missing individually and in combination, an unknown `request_class`, and a deferrable class with no idempotency key.~~ ✅ Met — 58 tests (94 total). One worth naming: an unknown class does **not** also demand an idempotency key, because we cannot know whether it is deferrable and a guessed second problem sends the client chasing a requirement that may not exist.
 
 ### P1-T3 — Provider adapter protocol and error taxonomy skeleton
 **1.0h · FR-2.4**
@@ -114,7 +116,7 @@ Per D-A, in-process. Scope is capped at four things and nothing else: **latency 
 
 **Done when:** a `TestClient` smoke test sends the same body against two configs — one preferring `mock_chaos`, one preferring `cohere_primary` with a stubbed adapter — and gets the same response shape with a different `X-Keel-Provider`. **This is the M1 exit criterion.**
 
-**Phase 1 total: 10.0h.**
+**Phase 1 total: 10.75h** — 0.75h over, all of it the P1-T2 body extension.
 
 ---
 
@@ -194,6 +196,8 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 
 | Change | Trigger |
 |---|---|
+| ~~`docs/adr/0003-the-client-error-body-nests-keel-detail-inside-the-openai-error-envelope.md`~~ ✅ | With P1-T2 |
+| ~~Technical design §5.1 — name the `x_keel` body extension; `request_class` is `str` not enum; `capabilities` is `frozenset`~~ ✅ | With P1-T2 |
 | `docs/adr/0002-mock-provider-is-an-in-process-adapter.md` | Before P1-T4 |
 | Technical design §8 — remove `mock-provider:9001` from the deployment diagram | With ADR 0002 |
 | Technical design §8 repo layout — add `keel/clock.py`, `scripts/` | End of Phase 1 |

@@ -158,7 +158,7 @@ The `X-Keel-Provider`, `X-Keel-Attempts`, and `X-Keel-Cost-Micros` response head
 
 The public surface is an OpenAI-compatible `POST /v1/chat/completions`. Compatibility is what makes adoption a base-URL change (FR-1.1), but Keel needs metadata the OpenAI schema does not carry.
 
-**Approach:** metadata travels in headers, with a request-body extension field as fallback for clients that cannot set headers.
+**Approach:** metadata travels in headers, with an `x_keel` object in the request body as fallback for clients that cannot set headers. The header wins when both supply a field, and `x_keel` is stripped from the payload before it reaches a provider — a header survives request-body pass-through untouched, a body field would not.
 
 ```
 X-Keel-Tenant: acme            (required)
@@ -169,7 +169,7 @@ X-Keel-Capabilities: citations,tool_use   (optional, comma separated)
 X-Keel-Idempotency-Key: ...     (required for deferrable classes)
 ```
 
-Headers are preferred over body fields because they survive request-body pass-through to providers untouched, and because a proxy can inspect them without parsing JSON. Missing required metadata returns `400` with a machine-readable error listing the absent fields (FR-1.3) — this is deliberate strictness, since a gateway that accepts untagged traffic cannot honour S4.
+Headers are preferred over body fields because they survive request-body pass-through to providers untouched, and because a proxy can inspect them without parsing JSON. Missing required metadata returns `400` with a machine-readable error listing *all* the absent fields, not the first (FR-1.3; body shape in ADR 0003) — this is deliberate strictness, since a gateway that accepts untagged traffic cannot honour S4.
 
 Internally every request becomes a `RequestEnvelope`:
 
@@ -178,8 +178,8 @@ Internally every request becomes a `RequestEnvelope`:
 | `request_id` | str | Correlation key across attempts, logs, metrics |
 | `tenant` | str | Cost and metric dimension |
 | `feature` | str | Cost and metric dimension |
-| `request_class` | enum | Drives preference list, timeout, breaker budget |
-| `capabilities` | set[str] | Hard routing constraint |
+| `request_class` | str | Validated against `config.request_classes`, not an enum — classes are config-defined (principle 1). Drives preference list, timeout, breaker budget |
+| `capabilities` | frozenset[str] | Hard routing constraint. Matches `ProviderConfig.capabilities` |
 | `deferrable` | bool | Derived from class config |
 | `idempotency_key` | str \| None | Required when deferrable |
 | `payload` | dict | The provider-bound request body |

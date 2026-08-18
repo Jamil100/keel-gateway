@@ -1,15 +1,18 @@
 # Build Plan — Phases 1–2 (Milestones M1 and M2)
 
 **Owner:** Jamil
-**Status:** Draft v1.0
+**Status:** Draft v1.0 — in progress
 **Last updated:** 2026-08-18
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
+
+**Progress:** 1.0h of 21.0h. ✅ P1-T1 · ⬜ P1-T2 … P2-T6. Next up: **P1-T2 — request envelope and header validation.**
+Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, and empty package directories.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`.
 
 Not yet built: FastAPI ingress, provider adapters, router, health tracking, metrics, the compose stack.
 
@@ -19,9 +22,9 @@ Three Phase 0 exit items never landed and are folded in, sized at ~1.5h total:
 
 | # | Carry-over | Where it lands |
 |---|---|---|
-| C1 | `.env.example` (`.gitignore` already references it) | P1-T1 |
-| C2 | CI running the test suite (`.github/workflows/ci.yml`) | P1-T1 |
-| C3 | `docker compose up` starts a stack | P2-T6 — deferred from P0, since nothing existed to compose until Redis and Prometheus do |
+| ~~C1~~ | ~~`.env.example` (`.gitignore` already references it)~~ | P1-T1 — ✅ **DONE** |
+| ~~C2~~ | ~~CI running the test suite (`.github/workflows/ci.yml`)~~ | P1-T1 — ✅ **DONE** |
+| C3 | `docker compose up` starts a stack | P2-T6 — deferred from P0, since nothing existed to compose until Redis and Prometheus do — ⬜ open |
 
 ---
 
@@ -31,7 +34,7 @@ Three questions the design documents leave underspecified. Each is answered here
 
 **D-A — The mock provider is an in-process adapter, not a `:9001` container.**
 Technical design §8 draws `mock-provider:9001` as a compose service, but §5.3 and roadmap Phase 1 both describe an *adapter*. Decide for the adapter, and drop the container from the diagram. NFR-2 wants it callable from unit tests with no network; the Phase 6 chaos API (FR-7.2) mutates gateway-side state either way; and one fewer container helps the S8 five-minute cold start. The cost: the mock cannot simulate connection-level failures — DNS, TCP reset, half-open sockets. Record that cost in the ADR.
-→ Write `docs/adr/0001-mock-provider-is-an-in-process-adapter.md` and update technical design §8's deployment diagram.
+→ Write `docs/adr/0002-mock-provider-is-an-in-process-adapter.md` and update technical design §8's deployment diagram.
 
 **D-B — `Clock` lives at `keel/clock.py`, top level.**
 Absent from the §8 repo layout because it did not exist yet. It is consumed by health, breaker, executor, and queue, so it belongs to none of them.
@@ -45,14 +48,14 @@ Adapters return a `ProviderResult` and know nothing about Redis. The executor is
 
 **Exit criterion:** an identical request is served by Cohere or by a mock depending only on config; requests missing metadata are rejected with a machine-readable 400; the test suite runs with no network access.
 
-### P1-T1 — Foundations: clock, CI, env example
+### ~~P1-T1 — Foundations: clock, CI, env example~~ ✅ **DONE**
 **1.0h · NFR-2, C1, C2**
 
-- `keel/clock.py` — `Clock` protocol (`now() -> float`, `async sleep(seconds)`), `SystemClock`, and `ManualClock` with an explicit `advance(seconds)`. No test may call `time.sleep`.
-- `.env.example` — `COHERE_API_KEY`, `KEEL_CONFIG_PATH`, `REDIS_URL`. Azure and Bedrock placeholders commented out until access lands.
-- `.github/workflows/ci.yml` — `ruff check`, `mypy --strict`, `pytest`. No provider credentials in CI; the real-provider suite is marker-excluded from the start (`-m "not real_provider"`), before there is anything to exclude, so it is never a retrofit.
+- ~~`keel/clock.py` — `Clock` protocol (`now() -> float`, `async sleep(seconds)`), `SystemClock`, and `ManualClock` with an explicit `advance(seconds)`. No test may call `time.sleep`.~~ ✅ `keel/clock.py` + `tests/test_clock.py`
+- ~~`.env.example` — `COHERE_API_KEY`, `KEEL_CONFIG_PATH`, `REDIS_URL`. Azure and Bedrock placeholders commented out until access lands.~~ ✅
+- ~~`.github/workflows/ci.yml` — `ruff check`, `mypy --strict`, `pytest`. No provider credentials in CI; the real-provider suite is marker-excluded from the start (`-m "not real_provider"`), before there is anything to exclude, so it is never a retrofit.~~ ✅ 3.11/3.12 matrix
 
-**Done when:** `ManualClock` unit tests pass and CI is green on the existing `test_config.py`.
+**Done when:** ~~`ManualClock` unit tests pass and CI is green on the existing `test_config.py`.~~ ✅ Met — 36 tests. Local runs need `pip install -e ".[dev]"` first; without `pytest-asyncio` the seven async clock tests error out on collection.
 
 ### P1-T2 — Request envelope and header validation
 **1.5h · FR-1.2, FR-1.3, FR-1.4, FR-1.5**
@@ -191,8 +194,8 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 
 | Change | Trigger |
 |---|---|
-| `docs/adr/0001-mock-provider-is-an-in-process-adapter.md` | Before P1-T4 |
-| Technical design §8 — remove `mock-provider:9001` from the deployment diagram | With ADR 0001 |
+| `docs/adr/0002-mock-provider-is-an-in-process-adapter.md` | Before P1-T4 |
+| Technical design §8 — remove `mock-provider:9001` from the deployment diagram | With ADR 0002 |
 | Technical design §8 repo layout — add `keel/clock.py`, `scripts/` | End of Phase 1 |
 | README "Status" placeholder → what works today | End of each phase |
 | README "Quickstart" placeholder → real commands | P2-T6 |

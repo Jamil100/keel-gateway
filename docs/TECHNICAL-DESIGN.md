@@ -250,10 +250,10 @@ Each adapter implements one interface:
 class ProviderAdapter(Protocol):
     name: str
     async def invoke(self, envelope: RequestEnvelope) -> ProviderResult: ...
-    def capabilities(self) -> set[str]: ...
+    def capabilities(self) -> frozenset[str]: ...
 ```
 
-`ProviderResult` carries the normalized response, token counts, wall-clock latency, and either success or a `NormalizedError`.
+`ProviderResult` carries the normalized response, token counts, wall-clock latency, and either success or a `NormalizedError` — never both and never neither, enforced on the model. A provider failure is a **return value, not an exception**: failure is the case the gateway exists to handle, so it travels the same path as success rather than unwinding past the executor that has to record it. Absent token counts are `None` rather than `0`, or a provider that omits usage data becomes the cheapest one in the Phase 4 cost report.
 
 A routing library (LiteLLM) handles request/response shape translation where it can. The adapter layer sits *above* it rather than being replaced by it, for three reasons: it isolates the codebase from library version churn, it is where per-provider error normalization lives, and it is the only way to give the mock adapter first-class status.
 

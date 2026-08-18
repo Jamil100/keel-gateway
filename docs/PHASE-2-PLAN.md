@@ -5,14 +5,14 @@
 **Last updated:** 2026-08-18
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 3.25h of 21.75h. ✅ P1-T1 · ✅ P1-T2 · ⬜ P1-T3 … P2-T6. Next up: **P1-T3 — provider adapter protocol and error taxonomy skeleton.**
+**Progress:** 4.25h of 21.75h. ✅ P1-T1 · ✅ P1-T2 · ✅ P1-T3 · ⬜ P1-T4 … P2-T6. Next up: **P1-T4 — mock adapter (2.0h hard cap).**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`.
 
 Not yet built: FastAPI ingress, provider adapters, router, health tracking, metrics, the compose stack.
 
@@ -68,13 +68,13 @@ The 0.75h overrun is the request-body extension field. §5.1 calls for it as a f
 
 **Done when:** ~~table-driven tests cover every required header missing individually and in combination, an unknown `request_class`, and a deferrable class with no idempotency key.~~ ✅ Met — 58 tests (94 total). One worth naming: an unknown class does **not** also demand an idempotency key, because we cannot know whether it is deferrable and a guessed second problem sends the client chasing a requirement that may not exist.
 
-### P1-T3 — Provider adapter protocol and error taxonomy skeleton
+### ~~P1-T3 — Provider adapter protocol and error taxonomy skeleton~~ ✅ **DONE**
 **1.0h · FR-2.4**
 
-- `keel/providers/base.py` — `ProviderAdapter` protocol per §5.3, plus `ProviderResult` carrying the normalized response, `prompt_tokens` / `completion_tokens`, `latency_ms`, and either success or a `NormalizedError`.
-- `keel/providers/errors.py` — `ErrorClass` enum with the seven §5.4 classes and a `counts_toward_breaker` property. `AUTH_FAILURE`, `CONTENT_FILTER`, and `BAD_REQUEST` return `False` (D7). Per-provider *mapping* is deliberately deferred to P2-T1; this task fixes only the taxonomy.
+- ~~`keel/providers/base.py` — `ProviderAdapter` protocol per §5.3, plus `ProviderResult` carrying the normalized response, `prompt_tokens` / `completion_tokens`, `latency_ms`, and either success or a `NormalizedError`.~~ ✅ The sum type is enforced on the model — never both, never neither — and a provider failure is a *return value, not an exception*, so it cannot unwind past the executor that must record it (D-C).
+- ~~`keel/providers/errors.py` — `ErrorClass` enum with the seven §5.4 classes and a `counts_toward_breaker` property. `AUTH_FAILURE`, `CONTENT_FILTER`, and `BAD_REQUEST` return `False` (D7). Per-provider *mapping* is deliberately deferred to P2-T1; this task fixes only the taxonomy.~~ ✅ Both §5.4 columns are implemented — `retry_elsewhere` alongside `counts_toward_breaker` — since they are one table and Phase 3's router needs the second.
 
-**Done when:** a test asserts the exact §5.4 truth table for `counts_toward_breaker`, so a later edit to that table fails loudly rather than quietly changing when breakers trip.
+**Done when:** ~~a test asserts the exact §5.4 truth table for `counts_toward_breaker`, so a later edit to that table fails loudly rather than quietly changing when breakers trip.~~ ✅ Met — 33 tests (127 total). The table is transcribed by hand in `tests/test_provider_errors.py` rather than read from the module, so the two must agree. A completeness guard also **refuses to import** if a class is added without a row, rather than raising `KeyError` inside the breaker during an incident (verified by mutation).
 
 ### P1-T4 — Mock adapter
 **2.0h — hard cap · FR-2.2, NFR-2**
@@ -197,6 +197,7 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | Change | Trigger |
 |---|---|
 | ~~`docs/adr/0003-the-client-error-body-nests-keel-detail-inside-the-openai-error-envelope.md`~~ ✅ | With P1-T2 |
+| ~~Technical design §5.3 — `capabilities()` returns `frozenset`; `ProviderResult` invariants and failure-as-return-value~~ ✅ | With P1-T3 |
 | ~~Technical design §5.1 — name the `x_keel` body extension; `request_class` is `str` not enum; `capabilities` is `frozenset`~~ ✅ | With P1-T2 |
 | `docs/adr/0002-mock-provider-is-an-in-process-adapter.md` | Before P1-T4 |
 | Technical design §8 — remove `mock-provider:9001` from the deployment diagram | With ADR 0002 |

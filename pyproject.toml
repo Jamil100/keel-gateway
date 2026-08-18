@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "keel"
+version = "0.1.0"
+description = "A self-healing, multi-provider LLM gateway with capability-aware failover."
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Lower bounds only, and only where the major version carries meaning
+# (pydantic v2 API, redis-py native asyncio). Exact pins land with a lockfile
+# once the dependency set is confirmed against real providers.
+dependencies = [
+    "fastapi",                # ingress; TECHNICAL-DESIGN §3 "Keel Gateway - FastAPI process"
+    "uvicorn[standard]",      # ASGI server for the gateway container, DEPLOYMENT §8
+    "pydantic>=2",            # RequestEnvelope + config validation, §5.1 / §5.2 / NFR-4
+    "pydantic-settings",      # .env credential loading, §8 deployment diagram
+    "pyyaml",                 # config/keel.yaml is the routing source of truth, §5.2
+    "litellm",                # request/response shape translation, §5.3 / D4
+    "redis>=5",               # health windows, breaker state, stream queue, idempotency, §5.5
+    "prometheus-client",      # metrics exporter, FR-3.3 / §6 metrics catalogue
+    "structlog",              # structured logs correlated by request_id, FR-7.3
+    "httpx",                  # async HTTP for the mock provider service, §5.3
+]
+
+[project.optional-dependencies]
+# Bedrock support in the routing library needs the AWS SDK. Kept optional so
+# the stack installs without it until Bedrock access lands.
+bedrock = [
+    "boto3",
+]
+
+dev = [
+    "pytest",
+    "pytest-asyncio",         # async adapter and executor tests
+    "fakeredis",              # NFR-2: no live dependencies in the test suite
+    "ruff",
+    "mypy",
+    "types-pyyaml",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["keel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

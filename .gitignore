@@ -1,0 +1,45 @@
+# --- Project-specific ---
+
+# Roadmap is kept local, not published with the repo.
+docs/ROADMAP.md
+
+# Provider credentials. .env.example is committed, .env never is.
+.env
+.env.*
+!.env.example
+
+# Local measurement output from the Phase 6 run, until numbers are
+# transcribed into the README results table.
+/measurements/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- Editors and OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

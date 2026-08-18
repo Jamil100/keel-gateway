@@ -1,0 +1,66 @@
+# Keel routing configuration.
+#
+# This file is the source of truth for routing behaviour (FR-2.3). Adding a
+# provider, reordering a preference list, or changing a breaker threshold
+# happens here and nowhere else.
+#
+# Validated at startup by keel/config.py. An invalid file fails the process
+# rather than surfacing at the first request (NFR-4).
+#
+# Structure follows TECHNICAL-DESIGN.md §5.2.
+
+providers:
+  cohere_primary:
+    adapter: cohere
+    model: command-a
+    capabilities: [citations, tool_use, structured_output]
+    # PRICING UNVERIFIED — placeholder values carried over from the design
+    # document example. Replace with real published rates and a dated source
+    # comment before any cost number is reported. Stale or invented rates
+    # corrupt every cost claim silently (TECHNICAL-DESIGN.md §10).
+    pricing: { input_per_mtok: 2.50, output_per_mtok: 10.00 }
+    timeout_ms: 30000
+  azure_fallback:
+    adapter: azure_openai
+    deployment: gpt-4o
+    capabilities: [tool_use, structured_output]
+    # PRICING UNVERIFIED — see note above.
+    pricing: { input_per_mtok: 2.50, output_per_mtok: 10.00 }
+    timeout_ms: 30000
+  bedrock_fallback:
+    adapter: bedrock
+    model: anthropic.claude-sonnet-4
+    capabilities: [tool_use, structured_output]
+    # PRICING UNVERIFIED — see note above.
+    pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00 }
+    timeout_ms: 30000
+  mock_chaos:
+    adapter: mock
+    capabilities: [citations, tool_use, structured_output]
+    # Mock provider costs nothing. These zeros are real, not placeholders.
+    pricing: { input_per_mtok: 0.0, output_per_mtok: 0.0 }
+
+request_classes:
+  interactive_chat:
+    deferrable: false
+    preference: [cohere_primary, azure_fallback, bedrock_fallback]
+    latency_budget_p95_ms: 4000
+    hedge: { enabled: false, after_ms: 1500 }
+  classification:
+    deferrable: false
+    preference: [cohere_primary, azure_fallback]
+    latency_budget_p95_ms: 800
+    hedge: { enabled: true, after_ms: 400 }
+  batch_enrichment:
+    deferrable: true
+    preference: [cohere_primary, bedrock_fallback]
+    latency_budget_p95_ms: 60000
+
+breaker:
+  window_seconds: 60
+  bucket_seconds: 5
+  min_requests_in_window: 20
+  error_rate_threshold: 0.30
+  open_cooldown_seconds: 30
+  half_open_probe_ratio: 0.10
+  half_open_successes_to_close: 3

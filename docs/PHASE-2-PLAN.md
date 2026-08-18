@@ -5,18 +5,18 @@
 **Last updated:** 2026-08-18
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 6.25h of 21.75h. ✅ P1-T1 … P1-T4 · ⬜ P1-T5 … P2-T6. Next up: **P1-T5 — Cohere adapter and provider registry.**
+**Progress:** 9.25h of 22.75h. ✅ P1-T1 … P1-T5 · ⬜ P1-T6 … P2-T6. Next up: **P1-T6 — Static router and executor.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`.
 
-Not yet built: FastAPI ingress, provider adapters, router, health tracking, metrics, the compose stack.
+Not yet built: FastAPI ingress, router, health tracking, metrics, the compose stack.
 
-This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~21.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
+This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~22.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
 
 Three Phase 0 exit items never landed and are folded in, sized at ~1.5h total:
 
@@ -90,14 +90,17 @@ Per D-A, in-process. Scope is capped at four things and nothing else: **latency 
 
 **Done when:** ~~`error_rate=0.5` with a fixed seed produces a deterministic, asserted pass/fail sequence, and injected latency advances `ManualClock` without real waiting.~~ ✅ Met — 34 tests (161 total). The sequence is asserted as a literal string; 12 calls at `latency_ms=3000` advance `ManualClock` by 36s in 0.4ms of real time.
 
-### P1-T5 — Cohere adapter and provider registry
-**2.0h · FR-2.1**
+### ~~P1-T5 — Cohere adapter and provider registry~~ ✅ **DONE**
+**3.0h (est. 2.0h) · FR-2.1**
 
-- `keel/providers/cohere.py` — wraps LiteLLM per D4. The adapter layer sits *above* the library, not in place of it.
-- Error mapping is best-effort here; it gets real fixtures in P2-T1.
-- `keel/providers/registry.py` — build the adapter set from `KeelConfig.providers`, dispatching on `AdapterName`. An unknown adapter is impossible by construction (the enum is closed), but a **missing credential must fail at startup, not at first request** (NFR-4).
+The 1.0h overrun is **ADR 0004** and everything it drags with it. The shipped `config/keel.yaml` declared `azure_fallback` and `bedrock_fallback`, which have neither an adapter nor credentials, so a registry that fails on what it cannot build could not start on the repo's own config. Trimming the config cost six re-anchored cases in `tests/test_config.py`, the ADR, and a §5.2 note. Phase 1 is now budgeted at 11.75h.
 
-**Done when:** an offline test builds the registry from the shipped `config/keel.yaml` and asserts each provider maps to the right adapter class. Any live Cohere call is a `real_provider`-marked test excluded from CI.
+- ~~`keel/providers/cohere.py` — wraps LiteLLM per D4. The adapter layer sits *above* the library, not in place of it.~~ ✅ Plus `keel/providers/credentials.py` — a `pydantic-settings` model that treats a **blank** `COHERE_API_KEY` as absent, since `.env.example` ships it empty and "copied the template, forgot to fill it in" is the likeliest real misconfiguration.
+- ~~Error mapping is best-effort here; it gets real fixtures in P2-T1.~~ ✅ Ordered isinstance table, most-specific-first. **The root of LiteLLM's exception tree is `openai.APIError`, not `litellm.APIError`** — LiteLLM's exceptions subclass the OpenAI SDK's, and its own `APIError` is a *sibling* of the rest, so a table using it as the catch-all matches almost nothing. Two orderings are load-bearing and pinned by tests: `Timeout` above `APIConnectionError` (§5.4 separates them because latency budgets do), and `ContentPolicyViolationError` above `BadRequestError` (or the D7 taxonomy split the M2 panel exists to show is wrong).
+- ~~`keel/providers/registry.py` — build the adapter set from `KeelConfig.providers`, dispatching on `AdapterName`. An unknown adapter is impossible by construction (the enum is closed), but a **missing credential must fail at startup, not at first request** (NFR-4).~~ ✅ `assert_never` on the match, so a fifth `AdapterName` is a type error rather than a runtime surprise. Every problem is reported at once, not the first.
+- **Beyond the bullet, and why:** the NFR-4 requirement is sharper than it reads. A missing credential surfaces at request time as `AUTH_FAILURE`, which **D7 excludes from the breaker** — so a lazily-built registry would fail 100% of traffic with every breaker closed and every dashboard green. That argument is what settled ADR 0004 against the cheaper "skip with a warning" option.
+
+**Done when:** ~~an offline test builds the registry from the shipped `config/keel.yaml` and asserts each provider maps to the right adapter class. Any live Cohere call is a `real_provider`-marked test excluded from CI.~~ ✅ Met — 74 tests (235 total, 1 skipped). Test-suite runtime went 0.9s → 5.2s: `import litellm` alone costs 4.5s, which is also why the adapter imports it lazily rather than at module scope. The error-mapping tests build **real** LiteLLM exceptions rather than stand-ins, which is what caught the wrong-root bug above.
 
 ### P1-T6 — Static router and executor
 **1.0h**
@@ -117,7 +120,7 @@ Per D-A, in-process. Scope is capped at four things and nothing else: **latency 
 
 **Done when:** a `TestClient` smoke test sends the same body against two configs — one preferring `mock_chaos`, one preferring `cohere_primary` with a stubbed adapter — and gets the same response shape with a different `X-Keel-Provider`. **This is the M1 exit criterion.**
 
-**Phase 1 total: 10.75h** — 0.75h over, all of it the P1-T2 body extension.
+**Phase 1 total: 11.75h** — 1.75h over: 0.75h the P1-T2 body extension, 1.0h ADR 0004 and the config trim in P1-T5.
 
 ---
 
@@ -202,6 +205,8 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | ~~Technical design §5.1 — name the `x_keel` body extension; `request_class` is `str` not enum; `capabilities` is `frozenset`~~ ✅ | With P1-T2 |
 | ~~`docs/adr/0002-the-mock-provider-is-an-in-process-adapter.md`~~ ✅ | Before P1-T4 |
 | ~~Technical design §8 — remove `mock-provider:9001` from the deployment diagram~~ ✅ | With ADR 0002 |
+| ~~`docs/adr/0004-the-registry-refuses-to-build-a-provider-it-cannot-serve.md`~~ ✅ | With P1-T5 |
+| ~~Technical design §5.2 — note that the shipped config carries two providers until Phase 4~~ ✅ | With ADR 0004 |
 | Technical design §8 repo layout — add `keel/clock.py`, `scripts/` | End of Phase 1 |
 | README "Status" placeholder → what works today | End of each phase |
 | README "Quickstart" placeholder → real commands | P2-T6 |

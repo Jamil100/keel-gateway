@@ -242,6 +242,8 @@ breaker:
 
 **Note the pricing values are illustrative.** Real per-model rates are populated at implementation time and version-controlled with a dated source comment, because stale pricing silently corrupts every cost claim the project makes.
 
+**The block above is the end state, not what ships today.** `azure_fallback` and `bedrock_fallback` are commented out in `config/keel.yaml` and absent from every preference list until Phase 4 brings their adapters and credentials (FR-2.6). The registry refuses to build a provider it cannot serve rather than skipping it, since a silently shortened preference list is a failover target the operator believes in and the gateway does not have — **ADR 0004**, which also records why `mock_chaos` carries the `citations` asymmetry in the meantime.
+
 ### 5.3 Provider adapters
 
 Each adapter implements one interface:

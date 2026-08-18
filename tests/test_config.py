@@ -51,12 +51,9 @@ def test_shipped_config_matches_design_section_5_2() -> None:
     """Assert the values TECHNICAL-DESIGN.md §5.2 specifies, not just that it parses."""
     config = load_config(SHIPPED_CONFIG)
 
-    assert set(config.providers) == {
-        "cohere_primary",
-        "azure_fallback",
-        "bedrock_fallback",
-        "mock_chaos",
-    }
+    # Two providers, not §5.2's four: azure_fallback and bedrock_fallback are
+    # stood down until Phase 4 because no adapter can build them (ADR 0004).
+    assert set(config.providers) == {"cohere_primary", "mock_chaos"}
     assert set(config.request_classes) == {
         "interactive_chat",
         "classification",
@@ -69,16 +66,13 @@ def test_shipped_config_matches_design_section_5_2() -> None:
     assert cohere.capabilities == frozenset({"citations", "tool_use", "structured_output"})
     assert cohere.timeout_ms == 30000
 
-    # Azure addresses a deployment, not a model.
-    azure = config.providers["azure_fallback"]
-    assert azure.deployment == "gpt-4o"
-    assert azure.model is None
-
-    # The fallbacks cannot serve citations. This is the asymmetry the whole
+    # The fallback cannot serve citations. This is the asymmetry the whole
     # capability filter exists for (§5.7) — if it ever becomes symmetric by
-    # accident, the failover story loses its point.
-    assert "citations" not in config.providers["azure_fallback"].capabilities
-    assert "citations" not in config.providers["bedrock_fallback"].capabilities
+    # accident, the failover story loses its point. It rode on azure_fallback
+    # and bedrock_fallback until ADR 0004 stood both down; mock_chaos carries it
+    # now, so that Phase 3's filter still has something real to bite on.
+    assert "citations" in config.providers["cohere_primary"].capabilities
+    assert "citations" not in config.providers["mock_chaos"].capabilities
 
     # §5.2 omits timeout_ms and hedge in exactly these two places.
     assert config.providers["mock_chaos"].timeout_ms is None
@@ -129,22 +123,24 @@ def test_config_is_immutable() -> None:
     [
         pytest.param(
             lambda s: s.replace(
-                "preference: [cohere_primary, azure_fallback]",
-                "preference: [cohere_primary, azure_falback]",
+                "preference: [cohere_primary, mock_chaos]",
+                "preference: [cohere_primary, mock_chas]",
+                1,
             ),
-            "undefined provider(s) ['azure_falback']",
+            "undefined provider(s) ['mock_chas']",
             id="preference-references-unknown-provider",
         ),
         pytest.param(
             lambda s: s.replace(
-                "preference: [cohere_primary, azure_fallback]",
+                "preference: [cohere_primary, mock_chaos]",
                 "preference: [cohere_primary, cohere_primary]",
+                1,
             ),
             "repeats provider(s)",
             id="preference-repeats-a-provider",
         ),
         pytest.param(
-            lambda s: s.replace("preference: [cohere_primary, bedrock_fallback]", "preference: []"),
+            lambda s: s.replace("preference: [cohere_primary, mock_chaos]", "preference: []", 1),
             "at least 1 item",
             id="preference-empty",
         ),
@@ -158,10 +154,25 @@ def test_config_is_immutable() -> None:
             "Extra inputs are not permitted",
             id="misspelled-key-is-not-silently-ignored",
         ),
+        # Both azure cases now retarget a live entry rather than the stood-down
+        # azure_fallback block (ADR 0004): mock_chaos names neither a model nor
+        # a deployment, and cohere_primary names a model.
         pytest.param(
-            lambda s: s.replace("deployment: gpt-4o", "model: gpt-4o"),
+            lambda s: s.replace("    adapter: mock\n", "    adapter: azure_openai\n", 1),
             "adapter 'azure_openai' requires 'deployment'",
             id="azure-needs-a-deployment",
+        ),
+        pytest.param(
+            # Needs *both* fields present: the validator checks for a missing
+            # deployment first, so an entry with only a model never reaches the
+            # branch this case is here to cover.
+            lambda s: s.replace(
+                "    adapter: cohere\n    model: command-a\n",
+                "    adapter: azure_openai\n    model: command-a\n    deployment: gpt-4o\n",
+                1,
+            ),
+            "adapter 'azure_openai' addresses a 'deployment', not a 'model'",
+            id="azure-does-not-address-a-model",
         ),
         pytest.param(
             lambda s: s.replace(

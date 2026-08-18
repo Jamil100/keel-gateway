@@ -5,14 +5,14 @@
 **Last updated:** 2026-08-18
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 4.25h of 21.75h. ✅ P1-T1 · ✅ P1-T2 · ✅ P1-T3 · ⬜ P1-T4 … P2-T6. Next up: **P1-T4 — mock adapter (2.0h hard cap).**
+**Progress:** 6.25h of 21.75h. ✅ P1-T1 … P1-T4 · ⬜ P1-T5 … P2-T6. Next up: **P1-T5 — Cohere adapter and provider registry.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`.
 
 Not yet built: FastAPI ingress, provider adapters, router, health tracking, metrics, the compose stack.
 
@@ -34,7 +34,7 @@ Three questions the design documents leave underspecified. Each is answered here
 
 **D-A — The mock provider is an in-process adapter, not a `:9001` container.**
 Technical design §8 draws `mock-provider:9001` as a compose service, but §5.3 and roadmap Phase 1 both describe an *adapter*. Decide for the adapter, and drop the container from the diagram. NFR-2 wants it callable from unit tests with no network; the Phase 6 chaos API (FR-7.2) mutates gateway-side state either way; and one fewer container helps the S8 five-minute cold start. The cost: the mock cannot simulate connection-level failures — DNS, TCP reset, half-open sockets. Record that cost in the ADR.
-→ Write `docs/adr/0002-mock-provider-is-an-in-process-adapter.md` and update technical design §8's deployment diagram.
+→ ~~Write `docs/adr/0002-...md` and update technical design §8's deployment diagram.~~ ✅ **Done with P1-T4** — ADR 0002 accepted; the `mock-provider:9001` node and its `GW --> MK` edge are both gone from §8.
 
 **D-B — `Clock` lives at `keel/clock.py`, top level.**
 Absent from the §8 repo layout because it did not exist yet. It is consumed by health, breaker, executor, and queue, so it belongs to none of them.
@@ -76,18 +76,19 @@ The 0.75h overrun is the request-body extension field. §5.1 calls for it as a f
 
 **Done when:** ~~a test asserts the exact §5.4 truth table for `counts_toward_breaker`, so a later edit to that table fails loudly rather than quietly changing when breakers trip.~~ ✅ Met — 33 tests (127 total). The table is transcribed by hand in `tests/test_provider_errors.py` rather than read from the module, so the two must agree. A completeness guard also **refuses to import** if a class is added without a row, rather than raising `KeyError` inside the breaker during an incident (verified by mutation).
 
-### P1-T4 — Mock adapter
-**2.0h — hard cap · FR-2.2, NFR-2**
+### ~~P1-T4 — Mock adapter~~ ✅ **DONE**
+**2.0h — hard cap, met · FR-2.2, NFR-2**
 
 Per D-A, in-process. Scope is capped at four things and nothing else: **latency distribution, error rate, error class, seeded RNG.** State lives in a mutable `MockChaosState` object that the Phase 6 chaos API will mutate.
 
-- Seeded RNG, so a test can assert an exact outcome sequence.
-- Injected latency goes through `Clock.sleep`, so tests advance time rather than wait.
-- Returns a plausible OpenAI-shaped completion with token counts, so the Phase 4 cost engine has real numbers to work with.
+- ~~Seeded RNG, so a test can assert an exact outcome sequence.~~ ✅ **Three** streams derived from one seed — pass/fail, error class, latency — so *which* calls fail depends on the seed and `error_rate` alone. A single stream would let a change to the class mix or latency shift the failure pattern, and the two M2 load runs could not be compared.
+- ~~Injected latency goes through `Clock.sleep`, so tests advance time rather than wait.~~ ✅ Lognormal with `latency_ms` as the **median** and `latency_sigma` defaulting to `0.0` (fixed), so the M2 run's p95 lands exactly on the configured 3s. Raise sigma for the right tail Phase 3's p95-breach trigger needs.
+- ~~Returns a plausible OpenAI-shaped completion with token counts, so the Phase 4 cost engine has real numbers to work with.~~ ✅ Token counts derive from payload size, so cost moves with input rather than being constant.
+- **Beyond the bullet, and why:** `error_classes` is a weighted *mix*, not a single class. §5.3 says "error class" singular, but the M2 exit criterion requires the error-rate panel to split **across taxonomy classes** and `loadgen` has no flag to select one. One entry pins a single class, so the singular reading still works. `AUTH_FAILURE` and `BAD_REQUEST` are excluded from the default mix — a *provider* cannot cause either — while `CONTENT_FILTER` is included precisely because it does not count toward the breaker (D7).
 
 > **Scope tripwire** (roadmap §6; top-ranked PRD risk). If this exceeds 2.0h, freeze it at whatever exists and move on. No capability simulation, no streaming, no per-tenant behaviour.
 
-**Done when:** `error_rate=0.5` with a fixed seed produces a deterministic, asserted pass/fail sequence, and injected latency advances `ManualClock` without real waiting.
+**Done when:** ~~`error_rate=0.5` with a fixed seed produces a deterministic, asserted pass/fail sequence, and injected latency advances `ManualClock` without real waiting.~~ ✅ Met — 34 tests (161 total). The sequence is asserted as a literal string; 12 calls at `latency_ms=3000` advance `ManualClock` by 36s in 0.4ms of real time.
 
 ### P1-T5 — Cohere adapter and provider registry
 **2.0h · FR-2.1**
@@ -180,7 +181,7 @@ Sized 1.0h above the roadmap's 1.5h: it absorbs the Phase 0 compose carry-over (
 - `deploy/prometheus/prometheus.yml` — scrape the gateway. Scrape interval ≤ 5s, matching the bucket width; a slower interval makes the dashboard lag the health view and the demo look sluggish.
 - `deploy/grafana/provisioning/datasources/prometheus.yml` and `.../dashboards/keel.yml` — datasource and dashboard provider as version-controlled files.
 - `deploy/grafana/dashboards/keel-health.json` — the four panels Phase 2 can actually fill: **RPS by provider · error rate by normalized class · p95 latency by provider · gateway overhead.** Anonymous viewer access on, so a reviewer is not stopped by a login prompt (S8).
-- `scripts/loadgen.py` — small async driver sending tagged traffic through the gateway at a set RPS against `mock_chaos`, with a flag to change the mock's error rate mid-run. This is what makes the M2 exit demonstrable, and the Phase 6 measurement run reuses it rather than reinventing it.
+- `scripts/loadgen.py` — small async driver sending tagged traffic through the gateway at a set RPS against `mock_chaos`, with a flag to change the mock's error rate mid-run. **Open sequencing question:** that flag needs a way to reach `MockChaosState`, but the chaos API (FR-7.2) is scheduled for Phase 6. Either a minimal chaos endpoint lands early here, or loadgen sets the rate at gateway startup only. Decide when P2-T6 starts — the cheap option is a single `POST /chaos/{provider}` since the state object is already runtime-mutable and validated on assignment. This is what makes the M2 exit demonstrable, and the Phase 6 measurement run reuses it rather than reinventing it.
 
 The remaining three panels — circuit state timeline, failover annotations, queue depth and cost — land in Phase 6 with the full seven-panel board.
 
@@ -199,8 +200,8 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | ~~`docs/adr/0003-the-client-error-body-nests-keel-detail-inside-the-openai-error-envelope.md`~~ ✅ | With P1-T2 |
 | ~~Technical design §5.3 — `capabilities()` returns `frozenset`; `ProviderResult` invariants and failure-as-return-value~~ ✅ | With P1-T3 |
 | ~~Technical design §5.1 — name the `x_keel` body extension; `request_class` is `str` not enum; `capabilities` is `frozenset`~~ ✅ | With P1-T2 |
-| `docs/adr/0002-mock-provider-is-an-in-process-adapter.md` | Before P1-T4 |
-| Technical design §8 — remove `mock-provider:9001` from the deployment diagram | With ADR 0002 |
+| ~~`docs/adr/0002-the-mock-provider-is-an-in-process-adapter.md`~~ ✅ | Before P1-T4 |
+| ~~Technical design §8 — remove `mock-provider:9001` from the deployment diagram~~ ✅ | With ADR 0002 |
 | Technical design §8 repo layout — add `keel/clock.py`, `scripts/` | End of Phase 1 |
 | README "Status" placeholder → what works today | End of each phase |
 | README "Quickstart" placeholder → real commands | P2-T6 |

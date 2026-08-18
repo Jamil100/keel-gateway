@@ -430,16 +430,16 @@ flowchart TB
         RD[("redis:7<br/>:6379")]
         PR["prometheus<br/>:9090"]
         GF["grafana<br/>:3000"]
-        MK["mock-provider<br/>:9001"]
     end
     ENV[".env<br/>provider credentials"] -.-> GW
     ENV -.-> WK
     GW --> RD
     WK --> RD
-    GW --> MK
     PR -->|scrape| GW
     GF --> PR
 ```
+
+There is no `mock-provider` container: the mock is an in-process adapter inside the gateway (**ADR 0002**), which is why §3 draws it as `AD4["Mock adapter"]` rather than as a service. It remains a permanent component — only the container is gone.
 
 `docker compose up` must reach a healthy dashboard in under five minutes on a clean machine (S8). Grafana dashboards and Prometheus scrape config are provisioned as version-controlled files, not configured by hand — a reviewer who has to build panels themselves will not.
 

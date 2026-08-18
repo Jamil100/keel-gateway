@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from keel.config import AdapterName, ConfigError, KeelConfig, load_config
 
@@ -112,8 +113,9 @@ def test_cohere_is_primary_for_every_class() -> None:
 
 
 def test_config_is_immutable() -> None:
+    """``frozen=True`` holds after load, so nothing mutates config at request time."""
     config = load_config(SHIPPED_CONFIG)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError, match="frozen"):
         config.breaker.window_seconds = 999  # type: ignore[misc]
 
 

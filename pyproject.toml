@@ -47,6 +47,11 @@ packages = ["keel"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Registered so the marker is a typo-checked name rather than a free-form
+# string, and so `-m "not real_provider"` in CI means something.
+markers = [
+    "real_provider: calls a live provider API. Excluded from CI (NFR-2); run deliberately, and mind the EUR 75 budget (NFR-3).",
+]
 
 [tool.ruff]
 target-version = "py311"

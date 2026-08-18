@@ -1,0 +1,54 @@
+# Lint, type-check, and test on every push and pull request.
+#
+# No provider credentials are configured here, deliberately. NFR-2 requires the
+# suite to run with no live API calls, so a workflow that cannot authenticate to
+# a provider is a workflow that enforces the requirement rather than trusting it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A superseded run on the same ref is wasted minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor declared in pyproject `requires-python` and the
+        # version mypy targets; 3.12 is what the dev machine runs. Both are
+        # tested because a floor nobody exercises is a floor nobody honours.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # The `bedrock` extra is excluded on purpose: boto3 is not needed until
+      # Phase 4, and installing it here would hide a missing-dependency bug.
+      - name: Install
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Type check
+        run: mypy --strict keel
+
+      - name: Test
+        run: pytest -m "not real_provider"

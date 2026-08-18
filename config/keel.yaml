@@ -4,10 +4,12 @@
 # provider, reordering a preference list, or changing a breaker threshold
 # happens here and nowhere else.
 #
-# Validated at startup by keel/config.py. An invalid file fails the process
-# rather than surfacing at the first request (NFR-4).
+# Validated at startup by keel/config.py, then built into adapters by
+# keel/providers/registry.py. Either step failing fails the process rather than
+# surfacing at the first request (NFR-4).
 #
-# Structure follows TECHNICAL-DESIGN.md §5.2.
+# Structure follows TECHNICAL-DESIGN.md §5.2. It carries only the providers that
+# have a working adapter and credentials today — see ADR 0004.
 
 providers:
   cohere_primary:
@@ -20,40 +22,61 @@ providers:
     # corrupt every cost claim silently (TECHNICAL-DESIGN.md §10).
     pricing: { input_per_mtok: 2.50, output_per_mtok: 10.00 }
     timeout_ms: 30000
-  azure_fallback:
-    adapter: azure_openai
-    deployment: gpt-4o
-    capabilities: [tool_use, structured_output]
-    # PRICING UNVERIFIED — see note above.
-    pricing: { input_per_mtok: 2.50, output_per_mtok: 10.00 }
-    timeout_ms: 30000
-  bedrock_fallback:
-    adapter: bedrock
-    model: anthropic.claude-sonnet-4
-    capabilities: [tool_use, structured_output]
-    # PRICING UNVERIFIED — see note above.
-    pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00 }
-    timeout_ms: 30000
+
   mock_chaos:
     adapter: mock
-    capabilities: [citations, tool_use, structured_output]
+    # Deliberately WITHOUT `citations`, which only cohere_primary offers. That
+    # asymmetry is the whole reason the §5.7 capability filter exists (D2): a
+    # citations-tagged request must never silently fail over to a target that
+    # cannot produce them. With azure_fallback and bedrock_fallback stood down
+    # until Phase 4, this is the only place that constraint can be demonstrated.
+    capabilities: [tool_use, structured_output]
     # Mock provider costs nothing. These zeros are real, not placeholders.
     pricing: { input_per_mtok: 0.0, output_per_mtok: 0.0 }
+
+  # --- Stood down until Phase 4 (ADR 0004, FR-2.6) ----------------------------
+  #
+  # Both adapters are declared in AdapterName but neither is implemented, and
+  # neither has credentials (.env.example keeps both blocks commented out). The
+  # registry refuses to build an adapter it cannot serve, so leaving these
+  # active would stop the gateway from starting at all.
+  #
+  # Restore all three parts together when access lands: uncomment the block,
+  # uncomment the credentials in .env, and put the entry back in the preference
+  # lists below. FR-2.2 is met in the meantime by mock_chaos, exactly as it
+  # anticipates — "Mock providers satisfy this initially; real fallbacks replace
+  # them as access lands."
+  #
+  # azure_fallback:
+  #   adapter: azure_openai
+  #   deployment: gpt-4o
+  #   capabilities: [tool_use, structured_output]
+  #   # PRICING UNVERIFIED — see note above.
+  #   pricing: { input_per_mtok: 2.50, output_per_mtok: 10.00 }
+  #   timeout_ms: 30000
+  #
+  # bedrock_fallback:
+  #   adapter: bedrock
+  #   model: anthropic.claude-sonnet-4
+  #   capabilities: [tool_use, structured_output]
+  #   # PRICING UNVERIFIED — see note above.
+  #   pricing: { input_per_mtok: 3.00, output_per_mtok: 15.00 }
+  #   timeout_ms: 30000
 
 request_classes:
   interactive_chat:
     deferrable: false
-    preference: [cohere_primary, azure_fallback, bedrock_fallback]
+    preference: [cohere_primary, mock_chaos]
     latency_budget_p95_ms: 4000
     hedge: { enabled: false, after_ms: 1500 }
   classification:
     deferrable: false
-    preference: [cohere_primary, azure_fallback]
+    preference: [cohere_primary, mock_chaos]
     latency_budget_p95_ms: 800
     hedge: { enabled: true, after_ms: 400 }
   batch_enrichment:
     deferrable: true
-    preference: [cohere_primary, bedrock_fallback]
+    preference: [cohere_primary, mock_chaos]
     latency_budget_p95_ms: 60000
 
 breaker:

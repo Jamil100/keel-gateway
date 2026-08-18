@@ -19,6 +19,10 @@ dependencies = [
     "pydantic-settings",      # .env credential loading, §8 deployment diagram
     "pyyaml",                 # config/keel.yaml is the routing source of truth, §5.2
     "litellm",                # request/response shape translation, §5.3 / D4
+    "openai",                 # not called directly: LiteLLM's exceptions subclass the OpenAI
+                              # SDK's, and openai.APIError is the root the §5.4 error map keys
+                              # on (keel/providers/cohere.py). LiteLLM pins it anyway; declared
+                              # here because we import it, not because we chose it.
     "redis>=5",               # health windows, breaker state, stream queue, idempotency, §5.5
     "prometheus-client",      # metrics exporter, FR-3.3 / §6 metrics catalogue
     "structlog",              # structured logs correlated by request_id, FR-7.3

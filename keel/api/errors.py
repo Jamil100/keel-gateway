@@ -19,18 +19,32 @@ breaker. :class:`ProblemCode` describes *client* fault at the gateway boundary
 and never reaches the breaker. Merging the two vocabularies would let a
 malformed client request look like provider degradation.
 
+**Two vocabularies meet here, and they do not merge.** :class:`ProblemCode`
+describes *client* fault at the gateway boundary. ``ErrorClass`` describes
+*provider* behaviour and feeds the breaker. The :class:`UpstreamError` family
+below is the translation layer between them: it renders an ``ErrorClass`` as an
+HTTP status without ever letting a taxonomy value become a ``ProblemCode``. The
+taxonomy value does reach the client, but under its own labelled key
+(``error.keel.error_class``), never as ``error.code``.
+
 This module deliberately imports no web framework. It raises and renders; the
 FastAPI exception handler that turns a :class:`KeelError` into a response is
-registered in ``keel/api/app.py`` (P1-T7).
+registered in ``keel/api/app.py`` (P1-T7). It also imports nothing from
+``keel.providers.base`` — that module imports ``keel.api.envelope``, which
+imports this one, so reaching for ``ProviderResult`` here would close an import
+cycle. :func:`upstream_error_for` takes the ``NormalizedError`` instead and the
+caller unwraps the result.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Final
 
 from pydantic import BaseModel, ConfigDict
+
+from keel.providers.errors import ErrorClass, NormalizedError
 
 __all__ = [
     "EnvelopeValidationError",
@@ -38,7 +52,13 @@ __all__ = [
     "KeelError",
     "MalformedRequestError",
     "ProblemCode",
+    "UpstreamBadRequestError",
+    "UpstreamError",
+    "UpstreamRateLimitError",
+    "UpstreamTimeoutError",
+    "UpstreamUnavailableError",
     "raise_for",
+    "upstream_error_for",
 ]
 
 
@@ -164,3 +184,115 @@ def raise_for(problems: Sequence[FieldProblem], request_id: str | None) -> None:
         else EnvelopeValidationError
     )
     raise error_class(_summarize(problems), fields=problems, request_id=request_id)
+
+
+class UpstreamError(KeelError):
+    """A provider was reached — or waited for — and did not serve the request.
+
+    Not a client fault, so ``fields`` stays empty: a :class:`FieldProblem` names
+    something the caller can fix in its own request, and there is nothing here it
+    could edit. ADR 0003 keeps the key present and empty rather than omitting it,
+    so a client parses one shape for every error.
+
+    The provider and its §5.4 class are reported under ``error.keel`` where a
+    machine can read them, which is what makes a 429 from the gateway
+    distinguishable from a 429 the gateway itself imposed in a later phase.
+    """
+
+    error_type: ClassVar[str] = "api_error"
+
+    def __init__(
+        self,
+        error: NormalizedError,
+        *,
+        provider: str,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            f"Upstream provider {provider!r} failed ({error.error_class.value}): {error.message}",
+            request_id=request_id,
+        )
+        self.provider = provider
+        self.error_class = error.error_class
+
+    def to_body(self) -> dict[str, Any]:
+        body = super().to_body()
+        keel = body["error"]["keel"]
+        keel["provider"] = self.provider
+        # The taxonomy value, under its own key. Deliberately not `error.code`:
+        # that field is the ProblemCode namespace and mixing the two would let a
+        # provider's behaviour look like a client mistake to anything branching
+        # on it.
+        keel["error_class"] = self.error_class.value
+        return body
+
+
+class UpstreamBadRequestError(UpstreamError):
+    """The provider rejected the payload itself. Resending it unchanged will not help."""
+
+    status_code: ClassVar[int] = 400
+    code: ClassVar[str] = "upstream_bad_request"
+
+
+class UpstreamRateLimitError(UpstreamError):
+    """The provider is throttling us, or the account is out of quota."""
+
+    status_code: ClassVar[int] = 429
+    code: ClassVar[str] = "upstream_rate_limit"
+
+
+class UpstreamTimeoutError(UpstreamError):
+    """The provider did not answer inside the deadline — its own, or the gateway's."""
+
+    status_code: ClassVar[int] = 504
+    code: ClassVar[str] = "upstream_timeout"
+
+
+class UpstreamUnavailableError(UpstreamError):
+    """No candidate served the request. §4's "503 with normalized error"."""
+
+    status_code: ClassVar[int] = 503
+    code: ClassVar[str] = "upstream_unavailable"
+
+
+# Transcribed by hand from the §5.4 taxonomy rather than derived from it, the same
+# posture as `tests/test_provider_errors.py`: the two must agree, and a change to
+# either has to be a deliberate edit to both.
+#
+# The two 400s are worth reading twice. `BAD_REQUEST` and `CONTENT_FILTER` are
+# exactly the classes D7 excludes from the breaker, and for the same underlying
+# reason — neither says anything about provider health. The status mapping and the
+# breaker rule agree because they are reading the same fact, not by coincidence.
+_UPSTREAM_BY_CLASS: Final[dict[ErrorClass, type[UpstreamError]]] = {
+    ErrorClass.BAD_REQUEST: UpstreamBadRequestError,
+    ErrorClass.CONTENT_FILTER: UpstreamBadRequestError,
+    ErrorClass.RATE_LIMIT: UpstreamRateLimitError,
+    ErrorClass.QUOTA_EXHAUSTED: UpstreamRateLimitError,
+    ErrorClass.TIMEOUT: UpstreamTimeoutError,
+    ErrorClass.AUTH_FAILURE: UpstreamUnavailableError,
+    ErrorClass.SERVER_ERROR: UpstreamUnavailableError,
+}
+
+# Refuse to import rather than raise `KeyError` inside a live request. An eighth
+# error class is a decision about what the gateway tells its callers, and it
+# should be made at a keyboard, not discovered during an incident. Same guard the
+# taxonomy module uses for `counts_toward_breaker`.
+_UNMAPPED: Final[frozenset[ErrorClass]] = frozenset(ErrorClass) - frozenset(_UPSTREAM_BY_CLASS)
+if _UNMAPPED:  # pragma: no cover - the table above is complete
+    raise RuntimeError(
+        f"no HTTP status is defined for error class(es) "
+        f"{sorted(cls.value for cls in _UNMAPPED)}; add a row to "
+        f"_UPSTREAM_BY_CLASS in keel/api/errors.py before the taxonomy grows"
+    )
+
+
+def upstream_error_for(
+    error: NormalizedError, *, provider: str, request_id: str | None = None
+) -> UpstreamError:
+    """The rendered error for a provider failure, keyed on its normalized class.
+
+    Takes the ``NormalizedError`` rather than the ``ProviderResult`` that carried
+    it, so this module never imports ``keel.providers.base`` and the import cycle
+    described in the module docstring stays open.
+    """
+    return _UPSTREAM_BY_CLASS[error.error_class](error, provider=provider, request_id=request_id)

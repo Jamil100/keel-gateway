@@ -284,12 +284,14 @@ Per-provider rolling window, persisted in Redis so restarts do not reset the hea
 **Key schema:**
 
 ```
-keel:health:{provider}:{bucket_epoch}     HASH   ok, err_rate_limit, err_timeout, ...   TTL 2×window
+keel:health:{provider}:{bucket_epoch}     HASH   ok + one err_* field per class         TTL 2×window
 keel:latency:{provider}:{bucket_epoch}    LIST   capped reservoir of latency samples     TTL 2×window
 keel:breaker:{provider}                   HASH   state, opened_at, probe_successes
 keel:queue:deferred                       STREAM  deferrable jobs
 keel:idem:{key}                           STRING  status + response, TTL 24h
 ```
+
+The health hash carries eight fields: `ok`, plus `err_` prefixed with each of the seven §5.4 class values — `err_rate_limit`, `err_timeout`, `err_server_error`, `err_quota_exhausted`, `err_auth_failure`, `err_content_filter`, `err_bad_request`. **All seven, not only the four D7 counts toward the breaker.** Deciding what counts is the breaker's job; the error-rate panel (FR-7.1) has to be able to show the split, and `CONTENT_FILTER` is in the mock's default mix precisely because it does *not* trip a circuit. These names are wire-visible and stable: renaming a class value orphans the counters already in Redis and breaks every dashboard query.
 
 Buckets are fixed-width (5 s) and the window is the union of the last 12 buckets. This is a **sliding window of discrete buckets**, not a true continuous sliding window — a deliberate simplification. The alternative, a sorted set of individual events, gives exact windowing at the cost of O(n) memory per provider and a `ZREMRANGEBYSCORE` on every request. Bucket granularity introduces at most 5 s of staleness at the window edge, which is well inside the S2 target of "p95 reroute time ≤ 2× window length."
 
@@ -455,6 +457,8 @@ keel/
 │   ├── clock.py           # injected time — consumed by health, breaker, executor, queue,
 │   │                      #   so it belongs to none of them (ADR 0001)
 │   ├── config.py          # the validated YAML schema, loaded once at startup
+│   ├── redis.py           # the shared client — health, breaker, queue, and idempotency
+│   │                      #   all use it, so it belongs to none of them (ADR 0008)
 │   ├── api/               # app factory, ingress, envelope validation, chaos endpoints
 │   ├── routing/           # router, preference resolution, capability filter
 │   ├── providers/         # adapters + normalization

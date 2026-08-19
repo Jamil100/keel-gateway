@@ -5,16 +5,16 @@
 **Last updated:** 2026-08-19
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 14.75h of 23.25h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 · ⬜ P2-T2 … P2-T6. Next up: **P2-T2 — Redis bucketed sliding window.**
+**Progress:** 17.5h of 23.25h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 · ✅ P2-T2 · ⬜ P2-T3 … P2-T6. Next up: **P2-T3 — Latency reservoir and percentiles.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`; P2-T2 adds `keel/health/window.py` and `keel/redis.py`, and wires the recording call into `keel/routing/executor.py`.
 
-Not yet built: health tracking, metrics, the compose stack.
+Not yet built: latency percentiles, metrics, structured logging, the compose stack. Health *counting* landed with P2-T2; nothing reads it back yet, which is FR-3.4 working as intended.
 
 This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~22.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
 
@@ -152,15 +152,21 @@ The 0.5h overrun is **ADR 0007** and the live-capture script the task bullets ne
 
 **Done when:** ~~every fixture replays to its expected `ErrorClass` in a parametrized test.~~ ✅ Met — 65 tests (383 total, 2 skipped), suite 5.7s → 7.9s. Verified end-to-end through the real HTTP stack: a bad key now returns `error.keel.error_class: "auth_failure"` where it returned `"server_error"`, with the status still 503 (ADR 0006 maps status from the class, and both classes land there) and the message still naming `APIConnectionError`, so the raw cause stays diagnosable from one line.
 
-### P2-T2 — Redis bucketed sliding window
-**2.0h · FR-3.1, FR-3.2, D3**
+### ~~P2-T2 — Redis bucketed sliding window~~ ✅ **DONE**
+**2.75h (est. 2.0h) · FR-3.1, FR-3.2, D3**
 
-- `keel/health/window.py` — key schema exactly as §5.5: `keel:health:{provider}:{bucket_epoch}` as a HASH of `ok` plus one field per error class, TTL 2× window.
-- Bucket index derived from the injected clock and `breaker.bucket_seconds`. A read merges the last `window_seconds / bucket_seconds` buckets — 12 with the shipped config. `config.py` already guarantees the window divides evenly into buckets, so no partial edge bucket exists to skew the rate.
-- Writes are one pipelined `HINCRBY` + `EXPIRE`: O(1) per request, bounded memory.
-- Hook the recording call into `keel/routing/executor.py` from P1-T6 (D-C). Recording must not block the response path.
+The 0.75h overrun is **ADR 0008** and `keel/redis.py`, neither of which the task bullets mention. This is the first task to open a Redis connection, so the connection posture had to be decided before any of the four bullets could be written — see below.
 
-**Done when:** `fakeredis` + `ManualClock` tests show counts entering the current bucket, the window rolling as time advances, and old buckets falling out of the merged view. Assert the 5s edge staleness explicitly — it is a documented property (D3), not a bug, and a test that pins it stops someone "fixing" it later.
+- ~~`keel/health/window.py` — key schema exactly as §5.5: `keel:health:{provider}:{bucket_epoch}` as a HASH of `ok` plus one field per error class, TTL 2× window.~~ ✅ **All seven classes get a field, not just the four D7 counts toward the breaker.** §5.5 elided the list as `...` and this task had to settle it: the M2 error-rate panel must split *across taxonomy classes*, and `MockAdapter`'s default mix carries `CONTENT_FILTER` precisely because it does not trip a circuit. Deciding what counts is the breaker's job in Phase 3; a recorder that filtered would leave that panel unable to show the distinction it exists to show. §5.5 now names all eight fields rather than leaving each reader to re-decide.
+- ~~Bucket index derived from the injected clock and `breaker.bucket_seconds`. A read merges the last `window_seconds / bucket_seconds` buckets — 12 with the shipped config.~~ ✅ Nothing hard-codes 5 s or 12; a test drives a non-shipped 30 s / 10 s geometry so a constant sneaking in fails rather than passing by coincidence. `config.py`'s divisibility validator is trusted rather than re-checked (NFR-4).
+- ~~Writes are one pipelined `HINCRBY` + `EXPIRE`: O(1) per request, bounded memory.~~ ✅ Transactional, which the bullet does not say and which matters: with `transaction=False` a connection lost between the two leaves a counted key with **no TTL**, and a provider serving one request before going quiet strands it forever — the bounded-memory half of D3 quietly undone. **That flag is not test-covered and the code says so**: `fakeredis` cannot drop a connection mid-pipeline, so an atomicity test would pass either way. Confirmed by mutation, and recorded in `record`'s docstring rather than in a test that would prove nothing.
+- ~~Hook the recording call into `keel/routing/executor.py` from P1-T6 (D-C). Recording must not block the response path.~~ ✅ One line, as that module's docstring promised. Both branches are covered by it — a returned provider failure and the synthesized gateway timeout — and the timeout one matters most, since an attempt nobody waited for is exactly what Phase 3 needs counted.
+- **Beyond the bullet, and why (1): ADR 0008.** Nothing in the PRD, the technical design, or ADRs 0001–0007 says what happens when Redis is unreachable, and this is the task that has to answer it. Two house postures disagree — NFR-4 and ADR 0004 say fail fast at startup, `/healthz` says absorb the failure — and they are reconciled by noticing the cases are not the same shape. A missing credential means the gateway **can never serve a request**; a missing Redis means it can serve **every** request and merely cannot remember how they went. So: no startup ping, a failed write logs a `WARNING` and returns, and a failed *read* returns `None` for **unknown** — never a zero-filled window, or a Redis outage would present every provider as flawless at the moment health data matters most. Phase 3's breaker must therefore hold on `None`, which is a constraint this task places on work not yet written.
+- **Beyond the bullet, and why (2):** the guard lives *inside* `HealthWindow`, not around the call in the executor. That keeps the hook the single line D-C promised, and it means Phase 3's breaker — a second caller, written later, by someone reading a method signature rather than a call site — cannot forget to repeat a guard it never saw. Both methods are time-boxed at 250 ms so a Redis that accepts a command and then stops answering becomes a dropped write rather than a hung request; `CancelledError` is deliberately not caught, or the executor could no longer cancel an attempt.
+- **The known cost, measured rather than assumed.** Verified end to end against a machine with no Redis: the gateway starts, `/healthz` and `POST /v1/chat/completions` both return 200 with `X-Keel-Provider` set, and each dropped write logs one `WARNING` naming the provider and field. But the request took **330 ms** — `redis-py` retries a refused connection rather than failing on the first `ECONNREFUSED`, so the 250 ms box was doing all the work and every failure arrived as a bare `TimeoutError` with an empty message. Socket deadlines below that box brought it to **~220 ms** and made the log line say `"Timeout connecting to server"`, which matters more, since until P2-T4 that line is the *only* evidence health data is being lost. It is still far past S5's 15 ms p95 budget: **"a Redis outage costs an observation, not a request" is true of correctness, not of latency.** The real fix is to stop asking a Redis that just refused us — which is a breaker over our own dependency, and §5's tripwire forbids building one during P2-T2. Recorded in ADR 0008 and left for P2-T4, where a dropped-write counter makes it visible enough to justify.
+- **Beyond the bullet, and why (3):** `keel/redis.py`, top level for the same reason `keel/clock.py` is (D-B) — §5.5 gives Redis four jobs across three packages. It carries `RedisSettings`, which is the first code in the repo to read `REDIS_URL`; `.env.example` has shipped it since P1-T1 with nothing consuming it. Blank counts as absent, the same rule `ProviderCredentials` and `_resolve_config_path` already apply, and for the same reason. `create_app` gains a `redis` injection point beside `registry` and `clock`, without which every test in `tests/test_app.py` would open a socket to localhost (NFR-2).
+
+**Done when:** ~~`fakeredis` + `ManualClock` tests show counts entering the current bucket, the window rolling as time advances, and old buckets falling out of the merged view. Assert the 5s edge staleness explicitly.~~ ✅ Met — 34 tests (417 total, 2 skipped), suite 7.9s → 8.1s. The D3 edge is pinned at **both** ends: an event at `t=0.0` survives the full 60 s, and one at `t=4.9` is evicted at `t=60.0` having lived only 55.1 s — up to one bucket *early*, which is the direction the trade actually runs. Verified by mutation that the tests bite: widening the merge range by one bucket fails five of them, including the D3 pair. The §5.5 key is transcribed by hand as a literal string rather than rebuilt from the module, same posture as the §5.4 truth table.
 
 ### P2-T3 — Latency reservoir and percentiles
 **1.5h · FR-3.1**
@@ -205,7 +211,7 @@ The remaining three panels — circuit state timeline, failover annotations, que
 
 **Done when:** on a clean machine, `docker compose up` → `python scripts/loadgen.py --rps 20 --error-rate 0.4` → all four panels move within 30 seconds, and the whole path from clone to moving dashboard is under five minutes. **This is the M2 exit criterion.**
 
-**Phase 2 total: 11.5h** — 1.5h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1. Under the 16.5h tripwire.
+**Phase 2 total: 12.25h** — 2.25h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1, 0.75h ADR 0008 and `keel/redis.py` in P2-T2. Under the 16.5h tripwire.
 
 ---
 
@@ -225,6 +231,8 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | ~~`docs/adr/0006-upstream-failures-map-to-http-status-by-normalized-error-class.md`~~ ✅ | With P1-T7 |
 | ~~ADR 0003 — note that `error.keel` is extensible; upstream errors add `provider` and `error_class`~~ ✅ | With ADR 0006 |
 | ~~`docs/adr/0007-message-refinement-may-only-replace-a-server-error.md`~~ ✅ | With P2-T1 |
+| ~~`docs/adr/0008-a-failed-health-write-is-dropped-not-raised.md`~~ ✅ | With P2-T2 |
+| ~~Technical design §5.5 — name all eight health-hash fields; §8 repo layout — add `keel/redis.py`~~ ✅ | With ADR 0008 |
 | ~~Technical design §8 repo layout — add `keel/clock.py`, `keel/api/app.py`, `scripts/`~~ ✅ | End of Phase 1 |
 | ~~README "Status" placeholder → what works today~~ ✅ (Phase 1) | End of each phase |
 | README "Quickstart" placeholder → real commands | P2-T6 |
@@ -239,7 +247,7 @@ The README quickstart placeholder already says to fill it in during Phase 2 — 
 |---|---|
 | Mock adapter (P1-T4) exceeds 2.0h | Freeze at current capability immediately. Top-ranked PRD risk |
 | Either phase exceeds 1.5× budget (15h / 16.5h) | Apply the roadmap §4 descope ladder rather than extending the phase |
-| Tempted to add the breaker "while I'm in here" during P2-T2 | Do not. FR-3.4 exists because a breaker with invisible inputs is guesswork |
+| ~~Tempted to add the breaker "while I'm in here" during P2-T2~~ — held; P2-T2 records and merges, nothing reads it | Still live for P2-T3/T4: the inputs are not observable until `/metrics` and the board exist |
 | Cohere spend approaches €10 across Phases 1–2 | Move all load generation to `mock_chaos` — the load driver defaults there anyway |
 
 ---

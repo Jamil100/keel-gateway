@@ -11,12 +11,11 @@ exception*.
 Like every adapter, this one knows nothing about Redis, health, or breakers.
 Recording the outcome belongs to the executor and only the executor (D-C).
 
-**Error mapping here is best-effort.** P2-T1 replaces it with captured fixtures
-replayed offline (§7). :func:`normalize_litellm_error` is public precisely so
-those fixtures have a stable entry point to replay against, and the unmapped
-default already has the shape P2-T1 commits to: ``SERVER_ERROR`` plus a warning
-naming the exception type, so a mapping gap surfaces rather than hiding inside
-a catch-all.
+**Error mapping now lives in** :mod:`keel.providers.normalize` (P2-T1,
+**ADR 0007**), shared with every other LiteLLM-backed adapter and replayed
+offline against captured fixtures (§7). :func:`normalize_litellm_error` remains
+the public entry point those fixtures use; all it adds is the Cohere identity
+that selects the per-provider refinement rules.
 
 **LiteLLM is imported lazily, and that is measured rather than assumed.**
 ``import litellm`` costs about 4.5 seconds. At module scope that lands on every
@@ -26,21 +25,19 @@ mock-only path — which is the whole M2 load run — never touches.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Awaitable, Callable, Mapping
-from functools import cache
 from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import BaseModel
 
 from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock
+from keel.config import AdapterName
 from keel.providers.base import ProviderAdapter, ProviderResult
-from keel.providers.errors import ErrorClass, NormalizedError
+from keel.providers.errors import NormalizedError
+from keel.providers.normalize import normalize_provider_error
 
 __all__ = ["CohereAdapter", "CompletionFn", "normalize_litellm_error"]
-
-_LOGGER: Final = logging.getLogger(__name__)
 
 # LiteLLM addresses a provider by prefixing the model. In litellm 1.97 both
 # `cohere/` and `cohere_chat/` resolve to CohereV2ChatConfig — the v2 chat API —
@@ -63,113 +60,25 @@ async def _default_acompletion(**kwargs: Any) -> Any:
 
 
 # --------------------------------------------------------------------------
-# Error mapping (best-effort; P2-T1 replaces this with captured fixtures)
+# Error mapping
 # --------------------------------------------------------------------------
 
 
-@cache
-def _error_map() -> tuple[tuple[type[BaseException], ErrorClass], ...]:
-    """The §5.4 mapping, **ordered most-specific-first and matched by isinstance**.
-
-    Two facts about LiteLLM's exceptions shape this table, both verified against
-    litellm 1.97.0 / openai 2.54.0 rather than assumed:
-
-    **The root of the tree is ``openai.APIError``, not ``litellm.APIError``.**
-    LiteLLM defines exceptions that subclass the OpenAI SDK's same-named ones,
-    and its own ``APIError`` is a *sibling* of the rest rather than their
-    ancestor — ``isinstance(litellm.RateLimitError(...), litellm.APIError)`` is
-    ``False``. A table that used ``litellm.APIError`` as its catch-all would
-    therefore catch almost nothing, and every real provider failure would fall
-    through to the unmapped default. So the catch-all rows name the OpenAI
-    classes, and the LiteLLM rows above them exist only where LiteLLM adds a
-    distinction the SDK does not have.
-
-    **Order is load-bearing.** Every row below sits above at least one ancestor
-    that would otherwise swallow it:
-
-    * ``Timeout`` subclasses ``openai.APITimeoutError`` → ``APIConnectionError``
-      → ``APIError``. Below any of them a timeout normalizes to
-      ``SERVER_ERROR`` — and §5.4 separates the two precisely because latency
-      budgets treat them differently.
-    * ``ContentPolicyViolationError`` subclasses ``BadRequestError``. Below it,
-      every content filter reads as ``BAD_REQUEST``. Both are excluded from the
-      breaker (D7) so the breaker would not notice — but the M2 taxonomy panel,
-      whose whole job is showing that split, would be wrong.
-
-    ``BudgetExceededError`` is the one exception outside the tree entirely: it
-    subclasses plain ``Exception``, so without its own row no catch-all reaches
-    it and quota exhaustion would arrive as an unmapped ``SERVER_ERROR``.
-
-    Cached because it is built from lazily imported modules. By the time any
-    error needs normalizing, the call that failed has already imported them.
-    """
-    import openai
-    from litellm import exceptions as lle
-
-    return (
-        # --- LiteLLM's own distinctions, which the OpenAI SDK does not draw ---
-        (lle.Timeout, ErrorClass.TIMEOUT),
-        (lle.BudgetExceededError, ErrorClass.QUOTA_EXHAUSTED),
-        (lle.ContentPolicyViolationError, ErrorClass.CONTENT_FILTER),
-        (lle.ContextWindowExceededError, ErrorClass.BAD_REQUEST),
-        (lle.ServiceUnavailableError, ErrorClass.SERVER_ERROR),
-        (lle.BadGatewayError, ErrorClass.SERVER_ERROR),
-        # --- the OpenAI hierarchy every LiteLLM exception actually derives from ---
-        (openai.APITimeoutError, ErrorClass.TIMEOUT),
-        (openai.RateLimitError, ErrorClass.RATE_LIMIT),
-        (openai.AuthenticationError, ErrorClass.AUTH_FAILURE),
-        (openai.PermissionDeniedError, ErrorClass.AUTH_FAILURE),
-        (openai.BadRequestError, ErrorClass.BAD_REQUEST),
-        (openai.UnprocessableEntityError, ErrorClass.BAD_REQUEST),
-        (openai.NotFoundError, ErrorClass.BAD_REQUEST),
-        (openai.ConflictError, ErrorClass.BAD_REQUEST),
-        (openai.InternalServerError, ErrorClass.SERVER_ERROR),
-        (openai.APIConnectionError, ErrorClass.SERVER_ERROR),
-        # --- the true root, so necessarily last ---
-        (openai.APIError, ErrorClass.SERVER_ERROR),
-    )
-
-
-def _classify(exc: Exception) -> ErrorClass:
-    for exception_type, error_class in _error_map():
-        if isinstance(exc, exception_type):
-            return error_class
-
-    # The P2-T1 contract: default to SERVER_ERROR, but name what was caught, so
-    # a mapping gap is one grep away rather than invisible.
-    _LOGGER.warning(
-        "unmapped provider exception %s normalized to %s; add it to the §5.4 map",
-        type(exc).__name__,
-        ErrorClass.SERVER_ERROR.value,
-    )
-    return ErrorClass.SERVER_ERROR
-
-
-def _status_code(exc: Exception) -> int | None:
-    """The provider's HTTP status, when the exception carried a plausible one."""
-    raw = getattr(exc, "status_code", None)
-    # bool is an int subclass, and a value outside the HTTP range is a library
-    # sentinel rather than a real response.
-    if isinstance(raw, bool) or not isinstance(raw, int):
-        return None
-    return raw if 100 <= raw <= 599 else None
-
-
 def normalize_litellm_error(exc: Exception) -> NormalizedError:
-    """Map one LiteLLM failure onto the §5.4 taxonomy.
+    """Map one Cohere failure onto the §5.4 taxonomy.
 
-    Public because P2-T1's captured fixtures replay against exactly this
-    function. Never raises: an adapter that failed to call a provider must not
-    then fail to describe the failure.
+    A thin delegate: the table itself lives in :mod:`keel.providers.normalize`,
+    shared with every other LiteLLM-backed adapter (**ADR 0007**). What this
+    function adds is the one thing the shared module cannot know — that failures
+    arriving here came from Cohere, which selects the per-provider refinement
+    rules that rescue a bad API key from being reported as a server error.
+
+    Kept as a named, public entry point because it is the seam the captured
+    fixtures replay against and the name the adapter and its tests already use.
+    Never raises: an adapter that failed to call a provider must not then fail to
+    describe the failure.
     """
-    return NormalizedError(
-        error_class=_classify(exc),
-        # str() on some LiteLLM exceptions is empty. The type name is a poor
-        # message, but a better one than nothing at all in a log line.
-        message=str(exc) or type(exc).__name__,
-        provider_error_type=type(exc).__name__,
-        status_code=_status_code(exc),
-    )
+    return normalize_provider_error(exc, provider=AdapterName.COHERE)
 
 
 # --------------------------------------------------------------------------

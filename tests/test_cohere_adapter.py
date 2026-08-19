@@ -341,6 +341,13 @@ async def test_a_cancelled_request_is_not_recorded_as_a_provider_failure() -> No
 
 # --------------------------------------------------------------------------
 # Claim #3 — the §5.4 mapping, and the ordering it depends on
+#
+# The table itself moved to keel/providers/normalize.py in P2-T1 (ADR 0007);
+# these tests stay here because they exercise it through the Cohere entry point,
+# which is the seam the adapter actually calls. Fixture replay lives in
+# tests/test_provider_normalize.py and does not replace them: this file pins the
+# exception *type* table and its two load-bearing orderings, which no captured
+# JSON body can express.
 # --------------------------------------------------------------------------
 
 
@@ -484,7 +491,7 @@ def test_an_unmapped_openai_sdk_error_still_classifies_rather_than_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A raw OpenAI SDK error passed through by LiteLLM must not hit the default."""
-    caplog.set_level(logging.WARNING, logger="keel.providers.cohere")
+    caplog.set_level(logging.WARNING, logger="keel.providers.normalize")
     exc = openai.RateLimitError(
         message="429", response=_response(429), body=None
     )
@@ -524,7 +531,7 @@ def test_an_unmapped_exception_defaults_to_server_error_and_warns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The P2-T1 contract: a catch-all that records what it caught."""
-    caplog.set_level(logging.WARNING, logger="keel.providers.cohere")
+    caplog.set_level(logging.WARNING, logger="keel.providers.normalize")
 
     normalized = normalize_litellm_error(ValueError("something new"))
 

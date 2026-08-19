@@ -16,17 +16,21 @@ runs the lifespan, so `app.state` stays empty and every request fails on a
 missing context — the `gateway` helper below exists partly to make that mistake
 unreachable.
 
-No network, no Redis, no real time (NFR-2).
+No network and no real time; `fakeredis` stands in for Redis (NFR-2). The
+client is injected rather than built, because the lifespan otherwise reaches
+for `REDIS_URL` and every test here would open a socket to localhost.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
+from fakeredis.aioredis import FakeRedis
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -36,6 +40,7 @@ from keel.api.app import create_app
 from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock, ManualClock
 from keel.config import ConfigError, KeelConfig, load_config
+from keel.health.window import HealthWindow
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.credentials import ProviderCredentials
 from keel.providers.errors import ErrorClass, NormalizedError
@@ -175,7 +180,12 @@ def gateway(
     if mutate is not None:
         mutate(registry)
 
-    app = create_app(config_path=path, clock=resolved_clock, registry=registry)
+    app = create_app(
+        config_path=path,
+        clock=resolved_clock,
+        registry=registry,
+        redis=FakeRedis(decode_responses=True),
+    )
     with TestClient(app) as client:
         yield client, resolved_stub
 
@@ -630,7 +640,7 @@ def test_the_config_path_comes_from_keel_config_path_when_no_override_is_given(
     monkeypatch.setenv("KEEL_CONFIG_PATH", str(path))
 
     clock = ManualClock(start=1_000.0)
-    app = create_app(clock=clock, credentials=CREDENTIALS)
+    app = create_app(clock=clock, credentials=CREDENTIALS, redis=FakeRedis(decode_responses=True))
     with TestClient(app) as client:
         response = client.post(ENDPOINT, headers=HEADERS, json=BODY)
 
@@ -666,7 +676,9 @@ def test_a_blank_config_path_variable_is_treated_as_absent(
     monkeypatch.setenv("KEEL_CONFIG_PATH", value)
     monkeypatch.chdir(REPO_ROOT)
 
-    app = create_app(clock=ManualClock(), credentials=CREDENTIALS)
+    app = create_app(
+        clock=ManualClock(), credentials=CREDENTIALS, redis=FakeRedis(decode_responses=True)
+    )
     with TestClient(app) as client:
         assert client.get("/healthz").status_code == 200
 
@@ -716,13 +728,51 @@ def test_the_config_and_registry_reach_app_state() -> None:
     """The lifespan wiring itself, since everything else asserts it only indirectly."""
     from keel.api.app import AppContext
 
-    app = create_app(config_path=SHIPPED_CONFIG, clock=ManualClock(), credentials=CREDENTIALS)
+    app = create_app(
+        config_path=SHIPPED_CONFIG,
+        clock=ManualClock(),
+        credentials=CREDENTIALS,
+        redis=FakeRedis(decode_responses=True),
+    )
     with TestClient(app):
         context = app.state.keel
 
     assert isinstance(context, AppContext)
     assert isinstance(context.config, KeelConfig)
     assert set(context.registry) == {"cohere_primary", "mock_chaos"}
+    assert isinstance(context.window, HealthWindow)
+
+
+def test_a_served_request_leaves_a_count_in_the_health_window() -> None:
+    """The P2-T2 wiring, proved through the real HTTP stack rather than at the seam.
+
+    `tests/test_health_window.py` pins what the window does and
+    `tests/test_executor.py` pins that the executor calls it; this pins that the
+    two are actually connected inside the app the lifespan builds. A recorder
+    wired correctly everywhere except in `create_app` would pass both of those
+    and still record nothing in production.
+
+    The injected client is deliberately read *after* the `TestClient` block
+    exits, which is exactly why the lifespan closes only a client it built
+    itself.
+    """
+    redis = FakeRedis(decode_responses=True)
+    clock = ManualClock(start=1_000.0)
+    config = load_config(SHIPPED_CONFIG)
+    registry = build_registry(config=config, clock=clock, credentials=CREDENTIALS)
+    registry["cohere_primary"] = StubCohere()
+
+    app = create_app(
+        config_path=SHIPPED_CONFIG, clock=clock, registry=registry, redis=redis
+    )
+    with TestClient(app) as client:
+        assert client.post(ENDPOINT, headers=HEADERS, json=BODY).status_code == 200
+        window = app.state.keel.window
+
+    counts = asyncio.run(window.read("cohere_primary"))
+    assert counts is not None
+    assert counts.ok == 1
+    assert counts.total == 1
 
 
 def test_unknown_json_paths_are_a_404_rather_than_an_ingress_attempt() -> None:

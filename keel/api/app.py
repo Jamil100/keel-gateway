@@ -36,6 +36,7 @@ from typing import Any, Final, NoReturn
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from redis.asyncio import Redis
 from starlette.responses import Response
 
 from keel.api.envelope import HEADER_REQUEST_ID, RequestEnvelope, build_envelope
@@ -49,9 +50,11 @@ from keel.api.errors import (
 )
 from keel.clock import Clock, SystemClock
 from keel.config import DEFAULT_CONFIG_PATH, KeelConfig, load_config
+from keel.health.window import HealthWindow
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.credentials import ProviderCredentials
 from keel.providers.registry import build_registry
+from keel.redis import create_redis_client
 from keel.routing.executor import Executor
 from keel.routing.router import Router
 
@@ -89,6 +92,10 @@ class AppContext:
     clock: Clock
     registry: Mapping[str, ProviderAdapter]
     executor: Executor
+    window: HealthWindow
+    """The health recorder. Held here as well as inside the executor because
+    Phase 3's breaker and P2-T4's exporter both read it without going through an
+    attempt, and one narrowed accessor beats four unchecked ``state`` reads."""
 
 
 def _context(request: Request) -> AppContext:
@@ -250,6 +257,7 @@ def create_app(
     clock: Clock | None = None,
     registry: Mapping[str, ProviderAdapter] | None = None,
     credentials: ProviderCredentials | None = None,
+    redis: Redis | None = None,
 ) -> FastAPI:
     """Build the gateway app. Does no I/O — every read happens in the lifespan.
 
@@ -262,6 +270,13 @@ def create_app(
         inside the lifespan, so the ADR 0004 startup guarantee applies.
     :param credentials: passed to ``build_registry``; ignored when ``registry``
         is supplied.
+    :param redis: a pre-built client, for tests that must not touch a socket.
+        When omitted the lifespan builds one from ``REDIS_URL`` and closes it on
+        shutdown; an injected client is left open, because it belongs to the
+        caller and a test may want to read the health keys back after the
+        ``TestClient`` block exits. Without this parameter every test in
+        ``tests/test_app.py`` would attempt a real connection to localhost, which
+        NFR-2 rules out.
     """
 
     @asynccontextmanager
@@ -279,6 +294,15 @@ def create_app(
             else build_registry(config=config, clock=resolved_clock, credentials=credentials)
         )
 
+        # Deliberately not pinged (ADR 0008). `from_url` opens no socket, so an
+        # unreachable Redis does not stop the gateway starting — unlike a missing
+        # credential, which means it could never serve a request at all. Health
+        # data is not required to answer one, and coupling the two would turn a
+        # Redis restart into a gateway outage.
+        owns_redis = redis is None
+        client = create_redis_client() if redis is None else redis
+        window = HealthWindow(redis=client, breaker=config.breaker, clock=resolved_clock)
+
         setattr(
             app.state,
             STATE_KEY,
@@ -291,15 +315,20 @@ def create_app(
                     config=config,
                     registry=adapters,
                     clock=resolved_clock,
+                    window=window,
                 ),
+                window=window,
             ),
         )
 
         yield
 
-        # --- Phase 2 seam: shutdown -------------------------------------------
-        # Nothing to close today. The mock is in-process (ADR 0002) and Cohere's
-        # transport belongs to LiteLLM. P2-T2's Redis pool is disposed here.
+        # --- Shutdown ---------------------------------------------------------
+        # The mock is in-process (ADR 0002) and Cohere's transport belongs to
+        # LiteLLM, so the Redis pool is the only thing here. Closed only when this
+        # lifespan built it: an injected client belongs to whoever passed it.
+        if owns_redis:
+            await client.aclose()
 
     app = FastAPI(
         title="Keel",

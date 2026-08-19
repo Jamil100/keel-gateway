@@ -18,7 +18,15 @@ The timeout tests therefore use `SystemClock`, a fake adapter awaiting a real
 `asyncio.sleep`, and a deadline of a few milliseconds. Total cost to the suite
 is well under a tenth of a second, and nothing calls `time.sleep` (NFR-2).
 
-Everything else runs on `ManualClock`. No network, no Redis.
+P2-T2 adds a third thing: the executor now records every attempt into the health
+window (D-C), which is the one call site Phase 3's breaker will read from. The
+cases at the bottom pin that both branches above — a returned provider failure and
+a synthesized gateway timeout — reach it under the right taxonomy field, because a
+recorder wired to only the happy path would leave the breaker blind to exactly the
+attempts it exists to notice.
+
+Everything else runs on `ManualClock`. No network, and `fakeredis` rather than
+Redis (NFR-2).
 """
 
 from __future__ import annotations
@@ -28,10 +36,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from fakeredis.aioredis import FakeRedis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock, ManualClock, SystemClock
 from keel.config import KeelConfig, load_config
+from keel.health.window import FIELD_OK, HealthWindow
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.credentials import ProviderCredentials
 from keel.providers.errors import ErrorClass, NormalizedError
@@ -83,16 +94,30 @@ def envelope(request_class: str = "interactive_chat") -> RequestEnvelope:
     )
 
 
+def health_window(config: KeelConfig, clock: Clock) -> HealthWindow:
+    """A window over `fakeredis`, so the executor's recording call has somewhere to go.
+
+    Every executor now records (D-C), and `HealthWindow` is a required
+    constructor argument precisely so a caller cannot forget to give it one. The
+    tests below mostly ignore what lands in it; the ones under "What the executor
+    records" are the ones that read it back.
+    """
+    return HealthWindow(redis=FakeRedis(decode_responses=True), breaker=config.breaker, clock=clock)
+
+
 def executor(
     config: KeelConfig,
     registry: dict[str, ProviderAdapter],
     clock: Clock | None = None,
+    window: HealthWindow | None = None,
 ) -> Executor:
+    resolved_clock = clock if clock is not None else ManualClock()
     return Executor(
         router=Router(config=config),
         config=config,
         registry=registry,
-        clock=clock if clock is not None else ManualClock(),
+        clock=resolved_clock,
+        window=window if window is not None else health_window(config, resolved_clock),
     )
 
 
@@ -179,6 +204,19 @@ class HangingAdapter:
 
 def fakes(**adapters: ProviderAdapter) -> dict[str, ProviderAdapter]:
     return dict(adapters)
+
+
+class BrokenRedis:
+    """A client that refuses every command, standing in for a Redis that is down.
+
+    `pipeline()` raises rather than returning a context manager, which is what a
+    connection failure looks like from `HealthWindow`'s side. Typed loosely and
+    passed where a `Redis` is expected: `mypy --strict` covers `keel/` only, and a
+    real client is far too large to subclass honestly.
+    """
+
+    def pipeline(self, transaction: bool = True) -> object:
+        raise RedisConnectionError("connection refused (test stub)")
 
 
 # --------------------------------------------------------------------------
@@ -517,3 +555,118 @@ def test_the_mock_first_mutation_still_matches_the_shipped_config(base_text: str
 
     assert base_text.count(anchor) == 1
     assert base_text.replace(anchor, replacement, 1) != base_text
+
+
+# --------------------------------------------------------------------------
+# What the executor records (P2-T2, D-C)
+# --------------------------------------------------------------------------
+
+
+async def test_a_success_is_recorded_against_the_provider_that_served_it() -> None:
+    """The `ok` field, keyed on the config entry rather than the adapter name."""
+    config = load_config(SHIPPED_CONFIG)
+    clock = ManualClock(start=55.0)
+    window = health_window(config, clock)
+
+    await executor(
+        config,
+        fakes(cohere_primary=RecordingAdapter("cohere_primary")),
+        clock,
+        window,
+    ).execute(envelope())
+
+    counts = await window.read("cohere_primary")
+    assert counts is not None
+    assert counts.ok == 1, "the attempt succeeded, so it belongs in `ok`"
+    assert counts.total == 1
+
+
+async def test_a_returned_provider_failure_is_recorded_under_its_error_class() -> None:
+    """A failure travels as a return value, and must still reach the window.
+
+    The failure branch is the one the breaker exists for. An executor that
+    recorded only successes would show a provider failing every request as a
+    provider with no traffic at all.
+    """
+    config = load_config(SHIPPED_CONFIG)
+    clock = ManualClock(start=55.0)
+    window = health_window(config, clock)
+
+    await executor(
+        config,
+        fakes(cohere_primary=FailingAdapter("cohere_primary", ErrorClass.RATE_LIMIT)),
+        clock,
+        window,
+    ).execute(envelope())
+
+    counts = await window.read("cohere_primary")
+    assert counts is not None
+    assert counts.ok == 0
+    assert counts.errors[ErrorClass.RATE_LIMIT] == 1
+
+
+async def test_a_gateway_timeout_is_recorded_even_though_no_adapter_returned(
+    base_text: str, write_config: Callable[[str], Path]
+) -> None:
+    """The synthesized result is recorded like any other, under `err_timeout`.
+
+    `wait_for` cancelled the adapter, so nothing below the executor ever produced
+    a result — and this is precisely the attempt Phase 3 most needs counted, since
+    a provider we consistently cannot wait for is unhealthy by any useful
+    definition. Real time, for the reason the module docstring gives.
+    """
+    config = load_config(write_config(base_text.replace("timeout_ms: 30000", "timeout_ms: 5", 1)))
+    clock = SystemClock()
+    window = health_window(config, clock)
+
+    result = await executor(
+        config,
+        fakes(cohere_primary=HangingAdapter("cohere_primary", seconds=0.05)),
+        clock,
+        window,
+    ).execute(envelope())
+
+    assert result.error is not None and result.error.error_class is ErrorClass.TIMEOUT
+    counts = await window.read("cohere_primary")
+    assert counts is not None
+    assert counts.errors[ErrorClass.TIMEOUT] == 1
+
+
+async def test_recording_lands_in_the_bucket_the_attempt_happened_in() -> None:
+    """The literal §5.5 key, so a schema change fails here rather than in Grafana."""
+    config = load_config(SHIPPED_CONFIG)
+    clock = ManualClock(start=55.0)
+    redis = FakeRedis(decode_responses=True)
+    window = HealthWindow(redis=redis, breaker=config.breaker, clock=clock)
+
+    await executor(
+        config,
+        fakes(cohere_primary=RecordingAdapter("cohere_primary")),
+        clock,
+        window,
+    ).execute(envelope())
+
+    assert await redis.hgetall("keel:health:cohere_primary:11") == {FIELD_OK: "1"}
+
+
+async def test_a_dead_redis_does_not_break_the_request() -> None:
+    """The whole point of ADR 0008, asserted where a client would feel it.
+
+    A Redis outage costs an observation. It must not cost the response, or the
+    gateway has turned a dependency's failure into its own — the failure it exists
+    to absorb.
+    """
+    config = load_config(SHIPPED_CONFIG)
+    clock = ManualClock(start=55.0)
+    dead = HealthWindow(redis=BrokenRedis(), breaker=config.breaker, clock=clock)
+
+    result = await executor(
+        config,
+        fakes(cohere_primary=RecordingAdapter("cohere_primary")),
+        clock,
+        dead,
+    ).execute(envelope())
+
+    assert result.ok, "the provider answered; Redis being down is not the client's problem"
+    assert result.response == {"id": "chatcmpl-cohere_primary", "object": "chat.completion"}
+    assert await dead.read("cohere_primary") is None, "unreadable is unknown, never zero"

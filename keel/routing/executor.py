@@ -4,8 +4,13 @@ The executor is the narrow waist of the request path (TECHNICAL-DESIGN.md §4):
 everything above it decides *what* to call, everything below it knows only how
 to call one provider, and this is the one place that watches an attempt from
 start to finish. That makes it the only honest place to record the outcome —
-decision D-C — which is why adapters know nothing about Redis and why P2-T2 has
-exactly one line to hook health recording into.
+decision D-C — which is why adapters know nothing about Redis and why P2-T2's
+health recording is the single line in ``execute`` below.
+
+That line is ``await``ed rather than spawned, and it cannot fail: ``HealthWindow``
+carries a never-raises contract and its own time box (ADR 0008), so a Redis outage
+costs an observation rather than a request. Guarding here as well would only give
+Phase 3's breaker a guard it could forget to copy.
 
 **Phase 1 invokes candidate 1 and stops.** No failover, no retry, no hedging.
 A returned failure is returned, not routed around, even when its
@@ -40,6 +45,7 @@ from typing import Final
 from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock
 from keel.config import KeelConfig
+from keel.health.window import HealthWindow
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.errors import ErrorClass, NormalizedError
 from keel.routing.router import Router
@@ -63,11 +69,19 @@ class Executor:
         config: KeelConfig,
         registry: Mapping[str, ProviderAdapter],
         clock: Clock,
+        window: HealthWindow,
     ) -> None:
+        # `window` is required rather than defaulting to None. An optional
+        # recorder is one that can be omitted by accident, and the result would be
+        # a gateway that starts cleanly, serves every request, and silently
+        # records nothing — the same shape of failure ADR 0004 refuses for a
+        # provider it cannot serve. Degrading when Redis is unreachable is
+        # `HealthWindow`'s job and it is unconditional, so no caller needs None.
         self._router = router
         self._config = config
         self._registry = registry
         self._clock = clock
+        self._window = window
 
     async def execute(self, envelope: RequestEnvelope) -> ProviderResult:
         """Run one attempt and return its outcome, success or failure.
@@ -105,11 +119,11 @@ class Executor:
             # chance to describe this failure, and the executor must.
             result = self._timed_out(provider, timeout_ms, started)
 
-        # --- P2-T2 seam (D-C): record health here ------------------------------
-        # `keel/health/window.py` records outcome, latency, and taxonomy for
-        # `result.provider`. One call site covering both branches above, which is
-        # the whole reason adapters were kept ignorant of Redis. Recording must
-        # not block the response path.
+        # One call site covering both branches above (D-C) — the whole reason
+        # adapters were kept ignorant of Redis. P2-T3 extends this to the latency
+        # reservoir, and Phase 3's breaker is the first thing that reads any of it
+        # back; recording it here is what FR-3.4 means by observing first.
+        await self._window.record(result)
 
         return result
 

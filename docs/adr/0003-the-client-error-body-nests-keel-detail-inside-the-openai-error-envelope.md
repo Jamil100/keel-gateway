@@ -57,6 +57,8 @@ Three supporting choices ship with it:
 
 **Non-field errors carry an empty `fields` list rather than omitting the key.** Slightly redundant on a 503, and it keeps the shape stable so a client parses one structure for every failure it will ever see.
 
+**The `keel` object is extensible, and P1-T7 was the first to extend it.** Upstream failures (ADR 0006) add `provider` and `error_class` alongside `request_id` and `fields`. That is the extension point working as intended — a client parsing the four documented keys is unaffected by a fifth — but it does mean `error.keel` is a superset by error family rather than one fixed record. Two rules keep that from drifting into a free-for-all: a key added for one family is never repurposed by another, and the §5.4 taxonomy value lives under its own `error_class` key and never becomes `error.code`, so the two vocabularies this ADR separates stay separated.
+
 ## Alternatives considered
 
 **A flat Keel-native envelope** (`{"code": ..., "message": ..., "fields": [...]}`). Cleaner to read and a level shallower. Rejected because an OpenAI SDK client hits `KeyError: 'error'` and reports a parse failure instead of the reason for the rejection — worst exactly where FR-1.1's adoption promise is being tested.

@@ -452,7 +452,10 @@ keel/
 ├── README.md              # demo video first, then architecture summary
 ├── docs/                  # PRD, this document, ADRs
 ├── keel/
-│   ├── api/               # ingress, envelope validation, chaos endpoints
+│   ├── clock.py           # injected time — consumed by health, breaker, executor, queue,
+│   │                      #   so it belongs to none of them (ADR 0001)
+│   ├── config.py          # the validated YAML schema, loaded once at startup
+│   ├── api/               # app factory, ingress, envelope validation, chaos endpoints
 │   ├── routing/           # router, preference resolution, capability filter
 │   ├── providers/         # adapters + normalization
 │   ├── health/            # window tracker, breaker
@@ -461,8 +464,11 @@ keel/
 │   └── observability/     # metrics, structured logging
 ├── config/keel.yaml
 ├── deploy/                # compose, prometheus, grafana provisioning
+├── scripts/               # loadgen and other operator-facing drivers
 └── tests/
 ```
+
+`keel/api/app.py` is the app factory and the only module that imports a web framework. Everything beneath it — envelope validation, routing, execution, normalization — is exercised with plain dicts and no HTTP (NFR-2), and `keel/api/errors.py` in particular imports no framework so the whole rejection path stays testable that way.
 
 ---
 

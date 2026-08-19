@@ -2,19 +2,19 @@
 
 **Owner:** Jamil
 **Status:** Draft v1.0 — in progress
-**Last updated:** 2026-08-18
+**Last updated:** 2026-08-19
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 10.25h of 22.75h. ✅ P1-T1 … P1-T6 · ⬜ P1-T7 … P2-T6. Next up: **P1-T7 — FastAPI app and the ingress endpoint.**
+**Progress:** 12.25h of 22.75h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ⬜ P2-T1 … P2-T6. Next up: **P2-T1 — Error normalization, per provider.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`.
 
-Not yet built: FastAPI ingress, health tracking, metrics, the compose stack.
+Not yet built: health tracking, metrics, the compose stack.
 
 This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~22.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
 
@@ -113,17 +113,22 @@ The 1.0h overrun is **ADR 0004** and everything it drags with it. The shipped `c
 
 **Done when:** ~~table-driven tests over `(request_class) → ordered candidates` for all three shipped classes.~~ ✅ Met — 32 tests (267 total, 1 skipped), suite 5.7s. The expected candidate lists are transcribed by hand rather than read back from the config, so the two must agree — same posture as the §5.4 table. Two tests assert the *absence* of behaviour and are meant to fail in Phase 3 rather than survive it: a `citations`-tagged request still sees `mock_chaos`, which lacks that capability, and a `SERVER_ERROR` whose own `retry_elsewhere` is `True` is returned rather than failed over. Pinning those makes Phase 3 a visible test edit instead of a silent change of meaning.
 
-### P1-T7 — FastAPI app and the ingress endpoint
-**1.5h · FR-1.1**
+### ~~P1-T7 — FastAPI app and the ingress endpoint~~ ✅ **DONE**
+**2.0h (est. 1.5h) · FR-1.1**
 
-- `keel/api/app.py` — app factory with a lifespan that calls `load_config()` once and fails the process on `ConfigError` (NFR-4). Config, clock, and registry live on app state.
-- `POST /v1/chat/completions` — OpenAI-compatible, so adoption is a base-URL and key change.
-- `GET /healthz` — liveness, for the compose healthcheck in P2-T6.
-- Response headers `X-Keel-Provider` and `X-Keel-Attempts` (§4). `X-Keel-Cost-Micros` waits for Phase 4.
+The 0.5h overrun is **ADR 0006** — the status mapping the task bullets never mention. See below.
 
-**Done when:** a `TestClient` smoke test sends the same body against two configs — one preferring `mock_chaos`, one preferring `cohere_primary` with a stubbed adapter — and gets the same response shape with a different `X-Keel-Provider`. **This is the M1 exit criterion.**
+- ~~`keel/api/app.py` — app factory with a lifespan that calls `load_config()` once and fails the process on `ConfigError` (NFR-4). Config, clock, and registry live on app state.~~ ✅ One `AppContext` frozen dataclass under one state key, narrowed by `isinstance` in one accessor: `State.__getattr__` returns `Any`, so four keys would mean four unchecked reads per request. The lifespan has **no `try`** — a `ConfigError` escaping the ASGI startup event is what makes uvicorn exit non-zero, so NFR-4 is satisfied by writing no error handling at all.
+- ~~`POST /v1/chat/completions` — OpenAI-compatible, so adoption is a base-URL and key change.~~ ✅ No pydantic body model — the payload is opaque pass-through — and for the same reason the route is annotated `-> Response`. **FastAPI infers a `response_model` from the return annotation**, so `-> dict[str, Any]` would re-serialize the provider's body through a generated model and drop both unknown fields and the response headers. It reads as a tightening and is a regression; a test sends an unknown key through to pin it.
+- ~~`GET /healthz` — liveness, for the compose healthcheck in P2-T6.~~ ✅ Touches nothing. The P2-T6 healthcheck *restarts the container* when it fails, so a probe that called a provider would turn a provider outage into a restart loop — the exact failure the gateway exists to absorb.
+- ~~Response headers `X-Keel-Provider` and `X-Keel-Attempts` (§4). `X-Keel-Cost-Micros` waits for Phase 4.~~ ✅ Both are set on the **failure** path too — a 503 that will not say who it tried is useless in the demo those headers exist for. `X-Keel-Attempts` is a named constant, not a new field on the frozen per-attempt `ProviderResult`; the executor's existing seam comment is where the real count begins in Phase 3.
+- **Beyond the bullet, and why (1):** `keel/api/app.py` is the first code in the repo to honour `KEEL_CONFIG_PATH`. It shipped in `.env.example` from P1-T1 and nothing read it — `ProviderCredentials` explicitly ignores it. Precedence is explicit argument → env → default, with a blank value treated as absent for the same reason a blank `COHERE_API_KEY` is.
+- **Beyond the bullet, and why (2):** a `ProviderResult` carrying an error is not an HTTP response, and nothing said what status it becomes. §4's literal answer is 503, but that tells an OpenAI-SDK client to retry a `CONTENT_FILTER` rejection forever — and FR-1.1's whole premise is clients arriving with retry policies already written. The status is looked up from the `ErrorClass` instead (**ADR 0006**), and the split is not arbitrary: **the two classes that map to 400 are exactly the two D7 keeps out of the breaker**, because "not evidence about provider health" and "not worth retrying" are the same fact read twice.
+- **Beyond the bullet, and why (3):** `stream: true` is rejected with a 400 naming FR-1.6 rather than passed through, since the alternative is handing it to an adapter with no streaming path and returning one non-streamed body to a client parsing for SSE. Checked *after* `build_envelope`, so FR-1.3's report-everything-at-once promise is untouched.
 
-**Phase 1 total: 11.75h** — 1.75h over: 0.75h the P1-T2 body extension, 1.0h ADR 0004 and the config trim in P1-T5.
+**Done when:** ~~a `TestClient` smoke test sends the same body against two configs — one preferring `mock_chaos`, one preferring `cohere_primary` with a stubbed adapter — and gets the same response shape with a different `X-Keel-Provider`.~~ ✅ **Met — M1 exit criterion cleared.** 51 tests (318 total, 1 deselected), suite 7.0s. The registry in those tests is built by the *real* `build_registry` so `mock_chaos` is a genuine `MockAdapter` and the ADR 0004 check runs; only the Cohere entry is swapped. Two tests are meant to be edited in Phase 3 rather than survive it — the attempts header pinned at `1`, and the absent `X-Keel-Cost-Micros` — and one asserts the route table is exactly two endpoints, so `/metrics` (P2-T4) and `/chaos` (Phase 6) cannot arrive unnoticed.
+
+**Phase 1 total: 12.25h** — 2.25h over: 0.75h the P1-T2 body extension, 1.0h ADR 0004 and the config trim in P1-T5, 0.5h ADR 0006. Under the 15h tripwire.
 
 ---
 
@@ -137,6 +142,11 @@ The 1.0h overrun is **ADR 0004** and everything it drags with it. The shipped `c
 - Fill in `keel/providers/errors.py`: map each adapter's raw failures onto the §5.4 taxonomy. HTTP 429, `ThrottlingException`, and `RateLimitError` all become `RATE_LIMIT` — the breaker must not see one concept as three.
 - `tests/fixtures/providers/{cohere,azure,bedrock}/*.json` — captured error responses replayed offline (§7). Cohere fixtures can be captured live now. Azure and Bedrock fixtures are hand-written from published error shapes and re-captured in Phase 4 when access lands; **mark the hand-written ones as unverified inside the fixture file itself**, not in a commit message nobody reads.
 - Unmapped provider exceptions default to `SERVER_ERROR` and emit a `WARNING` naming the exception type, so mapping gaps surface instead of hiding inside a catch-all.
+- **One fixture is already known and worth capturing first.** The P1-T7 live check sent a deliberately bogus `COHERE_API_KEY` and got back `error_class: server_error`, not `auth_failure` — LiteLLM surfaces an incorrect Cohere key as `APIConnectionError` wrapping a `CohereException`, not as `AuthenticationError`, so the P1-T5 isinstance table never reaches its auth row. The captured body:
+  ```
+  litellm.APIConnectionError: CohereException - {"message":"Incorrect API key provided: ..."}
+  ```
+  This matters more than one misfiled class: **D7 excludes `AUTH_FAILURE` from the breaker and includes `SERVER_ERROR`**, so today a wrong key trips the Phase 3 breaker on a provider that is perfectly healthy. Fixing it means matching on the wrapped message or status rather than the exception type alone.
 
 **Done when:** every fixture replays to its expected `ErrorClass` in a parametrized test.
 
@@ -210,8 +220,10 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | ~~Technical design §8 — remove `mock-provider:9001` from the deployment diagram~~ ✅ | With ADR 0002 |
 | ~~`docs/adr/0004-the-registry-refuses-to-build-a-provider-it-cannot-serve.md`~~ ✅ | With P1-T5 |
 | ~~Technical design §5.2 — note that the shipped config carries two providers until Phase 4~~ ✅ | With ADR 0004 |
-| Technical design §8 repo layout — add `keel/clock.py`, `scripts/` | End of Phase 1 |
-| README "Status" placeholder → what works today | End of each phase |
+| ~~`docs/adr/0006-upstream-failures-map-to-http-status-by-normalized-error-class.md`~~ ✅ | With P1-T7 |
+| ~~ADR 0003 — note that `error.keel` is extensible; upstream errors add `provider` and `error_class`~~ ✅ | With ADR 0006 |
+| ~~Technical design §8 repo layout — add `keel/clock.py`, `keel/api/app.py`, `scripts/`~~ ✅ | End of Phase 1 |
+| ~~README "Status" placeholder → what works today~~ ✅ (Phase 1) | End of each phase |
 | README "Quickstart" placeholder → real commands | P2-T6 |
 
 The README quickstart placeholder already says to fill it in during Phase 2 — P2-T6 is where that happens. Leave the measured-results table alone: it is filled from the Phase 6 run, with real numbers or not at all.

@@ -1,0 +1,386 @@
+"""The HTTP surface: one OpenAI-compatible endpoint, one liveness probe.
+
+This is the only module in the gateway that knows what a socket is. Everything
+below it — envelope validation, routing, execution, normalization — was built and
+tested against plain dicts (NFR-2), and this file is the thin adapter that turns
+a real request into those dicts and a ``ProviderResult`` back into a real
+response.
+
+**Adoption is a base-URL and key change (FR-1.1).** ``POST /v1/chat/completions``
+takes and returns the OpenAI shape, so an existing SDK client points at Keel and
+keeps working. The metadata Keel needs and OpenAI does not carry rides in
+``X-Keel-*`` headers (§5.1); the payload itself is opaque and is forwarded
+untouched.
+
+**Configuration is decided once, at startup (NFR-4).** The lifespan loads the
+config and builds the registry, and lets any ``ConfigError`` escape. The process
+then never accepts a request against a config it could not validate — which is
+the whole argument of ADR 0004, applied one level up: a gateway that starts
+"successfully" and fails every request is worse than one that refuses to start.
+
+**What is deliberately absent.** ``/metrics`` and the overhead middleware are
+P2-T4; structured logging is P2-T5; ``X-Keel-Cost-Micros`` waits for the Phase 4
+cost engine, because emitting a zero would be a cost claim and a wrong one; the
+``422`` for no capable provider (§5.7) and a real attempt count arrive with Phase
+3's failover loop; §4's ``202`` deferrable-enqueue branch is Phase 5.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Final, NoReturn
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.responses import Response
+
+from keel.api.envelope import HEADER_REQUEST_ID, RequestEnvelope, build_envelope
+from keel.api.errors import (
+    FieldProblem,
+    KeelError,
+    MalformedRequestError,
+    ProblemCode,
+    raise_for,
+    upstream_error_for,
+)
+from keel.clock import Clock, SystemClock
+from keel.config import DEFAULT_CONFIG_PATH, KeelConfig, load_config
+from keel.providers.base import ProviderAdapter, ProviderResult
+from keel.providers.credentials import ProviderCredentials
+from keel.providers.registry import build_registry
+from keel.routing.executor import Executor
+from keel.routing.router import Router
+
+__all__ = ["AppContext", "app", "create_app", "keel_error_handler"]
+
+CONFIG_PATH_ENV: Final = "KEEL_CONFIG_PATH"
+STATE_KEY: Final = "keel"
+
+HEADER_PROVIDER: Final = "X-Keel-Provider"
+HEADER_ATTEMPTS: Final = "X-Keel-Attempts"
+
+PHASE_1_ATTEMPTS: Final = 1
+"""Always one, because ``Executor.execute`` invokes candidate 1 and stops.
+
+A constant rather than a measurement, and honest about being one. When Phase 3's
+failover loop starts counting — the seam is already named in
+``keel/routing/executor.py`` — this is deleted and the real count travels on the
+result. The header does not change shape, so a client reading it today keeps
+working.
+"""
+
+STREAM_KEY: Final = "stream"
+
+
+@dataclass(frozen=True, slots=True)
+class AppContext:
+    """Everything the request path needs, decided once at startup.
+
+    One ``app.state`` key rather than four. ``State.__getattr__`` returns ``Any``,
+    so every attribute read off it is unchecked; funnelling them through one
+    dataclass means that happens exactly once, in :func:`_context`.
+    """
+
+    config: KeelConfig
+    clock: Clock
+    registry: Mapping[str, ProviderAdapter]
+    executor: Executor
+
+
+def _context(request: Request) -> AppContext:
+    """The startup context, narrowed from ``Any``."""
+    context = getattr(request.app.state, STATE_KEY, None)
+    if not isinstance(context, AppContext):  # pragma: no cover - the lifespan sets it
+        raise RuntimeError(
+            "the app has no startup context, so the lifespan did not run. In a test, use "
+            "`with TestClient(app) as client:` rather than a bare `TestClient(app)`."
+        )
+    return context
+
+
+def _resolve_config_path(override: str | Path | None) -> Path:
+    """Explicit argument, then ``KEEL_CONFIG_PATH``, then the shipped default.
+
+    Read at startup rather than at import, so the module-level :data:`app` does
+    not freeze whatever the environment happened to hold when Python imported
+    this file.
+
+    A blank value counts as absent, matching ``ProviderCredentials`` and for the
+    same reason: ``.env.example`` ships empty assignments, and "copied the
+    template, did not fill it in" must not become ``Path("")``. Note that
+    ``.env`` reaches this only through a real export — pydantic-settings reads
+    that file for credentials, not for ``os.environ`` at large — which compose's
+    ``env_file:`` does in P2-T6 and a bare dev shell does not.
+    """
+    if override is not None:
+        return Path(override)
+    from_env = os.environ.get(CONFIG_PATH_ENV, "").strip()
+    return Path(from_env) if from_env else DEFAULT_CONFIG_PATH
+
+
+def _json_type_name(value: object) -> str:
+    """The JSON name for a decoded value, so the error speaks the client's language."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
+
+
+def _reject_body(request: Request, detail: str, cause: BaseException | None) -> NoReturn:
+    """Raise the 400 for a body that never had a chance of being an envelope."""
+    raise MalformedRequestError(
+        "Request rejected: the request body must be a JSON object.",
+        fields=[FieldProblem(field="body", header=None, code=ProblemCode.INVALID, message=detail)],
+        # Best effort. The header may itself be missing, in which case
+        # `error.keel.request_id` is null and the client correlates by time —
+        # the same fallback ADR 0003 already describes.
+        request_id=request.headers.get(HEADER_REQUEST_ID),
+    ) from cause
+
+
+async def _decode_body(request: Request) -> Mapping[str, Any]:
+    """The body as a JSON object, or a 400 explaining why it is not one.
+
+    This is the one guard that has to sit *above* ``build_envelope`` rather than
+    inside it. That function's signature requires a ``Mapping`` and it calls
+    ``.items()`` immediately, so a bare JSON array would surface as a 500 for
+    what is plainly a client mistake.
+
+    FR-1.3's "report every problem at once" is knowingly narrowed here, and the
+    narrowing is honest: a body that is not an object cannot be searched for an
+    ``x_keel`` extension, so there are no header problems to collect alongside
+    this one. A client that sent an array gets the single sentence that matters.
+    """
+    try:
+        decoded: Any = await request.json()
+    except ValueError as exc:
+        # Starlette hands the bytes straight to `json.loads`, so an empty body
+        # arrives here too rather than as `None`. Caught as `ValueError` — the
+        # base of `JSONDecodeError` — so swapping the serializer cannot quietly
+        # turn a client mistake back into a 500.
+        _reject_body(request, f"could not be parsed as JSON ({exc})", exc)
+
+    if not isinstance(decoded, dict):
+        _reject_body(request, f"must be a JSON object; got {_json_type_name(decoded)}", None)
+
+    return decoded
+
+
+def _reject_streaming(envelope: RequestEnvelope) -> None:
+    """Refuse ``stream: true`` until FR-1.6 lands, rather than half-serving it.
+
+    Checked *after* the envelope is built, not before, so FR-1.3's promise is
+    untouched: a client with missing headers hears about all of them first and
+    only then about streaming. Passing this through instead would hand
+    ``stream: true`` to an adapter with no streaming path and return a single
+    non-streamed body to a client parsing for SSE — a wrong answer dressed as a
+    right one.
+    """
+    if envelope.payload.get(STREAM_KEY) is not True:
+        return
+    raise_for(
+        [
+            FieldProblem(
+                field=STREAM_KEY,
+                header=None,
+                code=ProblemCode.INVALID,
+                message=(
+                    "streaming responses are not supported yet (FR-1.6, Phase 2); "
+                    "omit `stream` or set it to false"
+                ),
+            )
+        ],
+        envelope.request_id,
+    )
+
+
+def _expect_response(result: ProviderResult) -> dict[str, Any]:
+    """Narrow a successful result's body for mypy.
+
+    ``ProviderResult`` enforces exactly one of ``response``/``error``, but that
+    is a runtime validator and invisible to a type checker. Same ``_expect``
+    idiom as ``envelope.py`` and ``registry.py``.
+    """
+    if result.response is None:  # pragma: no cover - the xor validator forbids it
+        raise RuntimeError("a successful ProviderResult carried no response")
+    return result.response
+
+
+def _render(error: KeelError, headers: Mapping[str, str] | None = None) -> JSONResponse:
+    """The single place a ``KeelError`` becomes bytes."""
+    return JSONResponse(
+        status_code=error.status_code,
+        content=error.to_body(),
+        headers=dict(headers) if headers else None,
+    )
+
+
+async def keel_error_handler(request: Request, exc: Exception) -> Response:
+    """Render any ``KeelError`` as the one client error body (ADR 0003).
+
+    Typed on ``Exception`` rather than ``KeelError`` because Starlette's
+    ``ExceptionHandler`` alias is ``Callable[[Request, Exception], ...]`` and
+    parameter types are contravariant — the narrower annotation is rejected by
+    ``mypy --strict`` at the registration call. The narrowing happens here
+    instead, and costs one branch.
+
+    Status and body both come from the exception, so §5.7's ``422`` and any later
+    subclass need no change here. Starlette walks the MRO when dispatching, so
+    registering the base class covers all of them.
+    """
+    if not isinstance(exc, KeelError):  # pragma: no cover - registered per class
+        raise exc
+    return _render(exc)
+
+
+def create_app(
+    *,
+    config_path: str | Path | None = None,
+    clock: Clock | None = None,
+    registry: Mapping[str, ProviderAdapter] | None = None,
+    credentials: ProviderCredentials | None = None,
+) -> FastAPI:
+    """Build the gateway app. Does no I/O — every read happens in the lifespan.
+
+    :param config_path: overrides ``KEEL_CONFIG_PATH`` and the shipped default.
+    :param clock: defaults to ``SystemClock()``, and that default matters beyond
+        tidiness: ``MockAdapter`` stamps ``created = int(clock.now())``, so a
+        ``ManualClock`` in production would date every completion to epoch 0.
+    :param registry: a pre-built adapter set, for tests that need a specific
+        adapter without a network. When omitted the real ``build_registry`` runs
+        inside the lifespan, so the ADR 0004 startup guarantee applies.
+    :param credentials: passed to ``build_registry``; ignored when ``registry``
+        is supplied.
+    """
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # No try/except, deliberately (NFR-4). A ConfigError raised here escapes
+        # the ASGI startup event: uvicorn logs "Application startup failed" and
+        # exits non-zero, and `TestClient.__enter__` re-raises it. Catching it to
+        # serve 500s instead would reintroduce exactly the lazy discovery ADR
+        # 0004 argues against — a green process failing every request.
+        resolved_clock: Clock = clock if clock is not None else SystemClock()
+        config = load_config(_resolve_config_path(config_path))
+        adapters: Mapping[str, ProviderAdapter] = (
+            registry
+            if registry is not None
+            else build_registry(config=config, clock=resolved_clock, credentials=credentials)
+        )
+
+        setattr(
+            app.state,
+            STATE_KEY,
+            AppContext(
+                config=config,
+                clock=resolved_clock,
+                registry=adapters,
+                executor=Executor(
+                    router=Router(config=config),
+                    config=config,
+                    registry=adapters,
+                    clock=resolved_clock,
+                ),
+            ),
+        )
+
+        yield
+
+        # --- Phase 2 seam: shutdown -------------------------------------------
+        # Nothing to close today. The mock is in-process (ADR 0002) and Cohere's
+        # transport belongs to LiteLLM. P2-T2's Redis pool is disposed here.
+
+    app = FastAPI(
+        title="Keel",
+        summary="A self-healing LLM gateway with an OpenAI-compatible surface.",
+        lifespan=lifespan,
+    )
+    app.add_exception_handler(KeelError, keel_error_handler)
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> Response:
+        """The OpenAI-compatible ingress (FR-1.1, §5.1).
+
+        There is no pydantic body model here, on purpose. The payload is opaque
+        pass-through: the gateway lifts ``x_keel`` out of it and forwards the
+        rest verbatim, so a model declared here would silently drop whatever
+        field OpenAI adds next and turn a working client into a broken one.
+        Validating the payload is the provider's job; validating the *envelope*
+        is ours.
+
+        For the same reason the return annotation is ``Response`` and must stay
+        that way. FastAPI infers a ``response_model`` from the return annotation,
+        so ``-> dict[str, Any]`` would re-serialize the provider's body through a
+        generated model and drop both the unknown fields and these headers. It
+        looks like a tightening and is a regression.
+        """
+        context = _context(request)
+        body = await _decode_body(request)
+
+        envelope = build_envelope(
+            # Starlette's `Headers` is a case-insensitive `Mapping[str, str]`,
+            # which is exactly what `build_envelope` documents accepting.
+            headers=request.headers,
+            body=body,
+            config=context.config,
+            clock=context.clock,
+        )
+        _reject_streaming(envelope)
+
+        result = await context.executor.execute(envelope)
+
+        # Set on the failure path too. A 503 that will not say which provider it
+        # tried is useless in the demo these headers exist for (§4), and the
+        # exception handler has no result to read a provider name from — which is
+        # why the failure branch renders inline rather than raising.
+        headers = {HEADER_PROVIDER: result.provider, HEADER_ATTEMPTS: str(PHASE_1_ATTEMPTS)}
+
+        if result.error is not None:
+            error = upstream_error_for(
+                result.error, provider=result.provider, request_id=envelope.request_id
+            )
+            return _render(error, headers)
+
+        return JSONResponse(content=_expect_response(result), headers=headers)
+
+    @app.get("/healthz")
+    async def healthz() -> Response:
+        """Liveness. The process is up and the event loop is turning — nothing more.
+
+        It touches no config, no registry, no provider, and (from P2-T2) no
+        Redis, and that restraint is the point. The P2-T6 compose healthcheck
+        *restarts the container* when this fails, so a probe that called a
+        provider would turn a provider outage into a restart loop — precisely the
+        failure this gateway exists to absorb. Deciding what to do about a
+        degraded provider is a routing question, and §5.6's breaker owns it.
+
+        One guarantee it does give for free: no route answers until the lifespan
+        has completed, so a 200 here means ``load_config`` and ``build_registry``
+        both succeeded. Readiness in the fuller sense — Redis reachable, queue
+        drained — is a different endpoint, and nothing needs it until there is
+        something for it to answer.
+        """
+        return JSONResponse({"status": "ok"})
+
+    return app
+
+
+app = create_app()
+"""The module-level ASGI app, for ``uvicorn keel.api.app:app`` and the P2-T6 image.
+
+Construction is I/O-free — the config file, ``KEEL_CONFIG_PATH``, and the
+credentials are all read inside the lifespan — so importing this module neither
+touches the filesystem nor can fail on a bad config. It fails at *startup*, which
+is where NFR-4 wants it.
+"""

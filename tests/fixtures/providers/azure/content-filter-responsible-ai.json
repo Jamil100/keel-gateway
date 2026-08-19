@@ -1,0 +1,26 @@
+{
+  "id": "azure-content-filter-responsible-ai",
+  "provider": "azure_openai",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED, and it records a known gap rather than a clean pass. Hand-written from Azure OpenAI's documented content-filter body; no Azure access until Phase 4 (ADR 0004). LiteLLM raises ContentPolicyViolationError only when the body contains BOTH 'invalid_request_error' AND 'content_policy_violation'; Azure's ResponsibleAIPolicyViolation body contains neither, so this arrives as a plain BadRequestError and classes bad_request. That is WRONG for the M2 taxonomy panel but harmless to the breaker, since D7 excludes both classes. Fixing it needs a bad_request -> content_filter refinement, which the P2-T1 invariant forbids (refinement may only replace server_error). Deferred to Phase 4 with the adapter; see ADR 0007 Consequences. The expectation below is deliberately the CURRENT behaviour, so the day someone widens the invariant this fixture fails and forces the decision to be made in the open.",
+  "exception": {
+    "module": "litellm",
+    "type": "BadRequestError",
+    "kwargs": {
+      "message": "AzureException - {\"error\":{\"code\":\"content_filter\",\"message\":\"The response was filtered due to the prompt triggering Azure OpenAI's content management policy.\",\"innererror\":{\"code\":\"ResponsibleAIPolicyViolation\"}}}",
+      "model": "gpt-4o",
+      "llm_provider": "azure"
+    },
+    "http": {
+      "status_code": 400,
+      "url": "https://example.openai.azure.com/openai/deployments/gpt-4o/chat/completions"
+    }
+  },
+  "expect": {
+    "error_class": "bad_request",
+    "status_code": 400,
+    "provider_error_type": "BadRequestError",
+    "message_contains": "ResponsibleAIPolicyViolation"
+  }
+}

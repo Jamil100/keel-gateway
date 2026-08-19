@@ -1,0 +1,21 @@
+{
+  "id": "cohere-budget-exceeded",
+  "provider": "cohere",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. BudgetExceededError is the one exception outside the OpenAI tree entirely - it subclasses plain Exception - so without its own row in the type table no catch-all reaches it and quota exhaustion arrives as an unmapped server_error. It also carries status 429 while classifying quota_exhausted, which is why no refinement rule may key on 429 alone.",
+  "exception": {
+    "module": "litellm",
+    "type": "BudgetExceededError",
+    "kwargs": {
+      "current_cost": 12.0,
+      "max_budget": 10.0
+    }
+  },
+  "expect": {
+    "error_class": "quota_exhausted",
+    "status_code": 429,
+    "provider_error_type": "BudgetExceededError",
+    "message_contains": "Budget has been exceeded"
+  }
+}

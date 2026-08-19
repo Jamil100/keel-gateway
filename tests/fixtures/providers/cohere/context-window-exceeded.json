@@ -1,0 +1,22 @@
+{
+  "id": "cohere-context-window-exceeded",
+  "provider": "cohere",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. A client fault: bad_request is excluded from the breaker and from retry_elsewhere (D7), because an oversized prompt fails identically everywhere.",
+  "exception": {
+    "module": "litellm",
+    "type": "ContextWindowExceededError",
+    "kwargs": {
+      "message": "CohereException - {\"message\":\"too many tokens: 300000 > 256000\"}",
+      "llm_provider": "cohere",
+      "model": "command-a"
+    }
+  },
+  "expect": {
+    "error_class": "bad_request",
+    "status_code": 400,
+    "provider_error_type": "ContextWindowExceededError",
+    "message_contains": "too many tokens"
+  }
+}

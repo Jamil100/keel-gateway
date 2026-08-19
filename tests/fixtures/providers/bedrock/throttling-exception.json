@@ -1,0 +1,26 @@
+{
+  "id": "bedrock-throttling-exception",
+  "provider": "bedrock",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. Hand-written from the AWS Bedrock Runtime error reference; no Bedrock access until Phase 4 (ADR 0004). The message shape was reproduced by running litellm's own bedrock mapper offline. This is the 5.4 headline case - an HTTP 429, a ThrottlingException, and a RateLimitError are one concept - and LiteLLM already types it correctly, so no refinement fires. The fixture exists to prove the type table alone suffices here, and that the normalizer is genuinely shared rather than Cohere-shaped.",
+  "exception": {
+    "module": "litellm",
+    "type": "RateLimitError",
+    "kwargs": {
+      "message": "BedrockException: Rate Limit Error - {\"__type\":\"ThrottlingException\",\"message\":\"Too many requests, please wait before trying again.\"}",
+      "llm_provider": "bedrock",
+      "model": "anthropic.claude-sonnet-4"
+    },
+    "http": {
+      "status_code": 429,
+      "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-sonnet-4/converse"
+    }
+  },
+  "expect": {
+    "error_class": "rate_limit",
+    "status_code": 429,
+    "provider_error_type": "RateLimitError",
+    "message_contains": "ThrottlingException"
+  }
+}

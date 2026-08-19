@@ -1,0 +1,22 @@
+{
+  "id": "cohere-content-filter",
+  "provider": "cohere",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. Pins the other load-bearing ordering: ContentPolicyViolationError subclasses BadRequestError, and below it every content filter would read as bad_request. Both are excluded from the breaker (D7), so the breaker cannot notice - but the M2 taxonomy panel exists precisely to show that split.",
+  "exception": {
+    "module": "litellm",
+    "type": "ContentPolicyViolationError",
+    "kwargs": {
+      "message": "CohereException - content blocked by safety settings",
+      "llm_provider": "cohere",
+      "model": "command-a"
+    }
+  },
+  "expect": {
+    "error_class": "content_filter",
+    "status_code": 400,
+    "provider_error_type": "ContentPolicyViolationError",
+    "message_contains": "blocked"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "cohere-timeout",
+  "provider": "cohere",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. litellm.Timeout carries status 408. Pins the ordering that keeps a timeout out of server_error: Timeout subclasses APITimeoutError -> APIConnectionError, and 5.4 separates the two because latency budgets do.",
+  "exception": {
+    "module": "litellm",
+    "type": "Timeout",
+    "kwargs": {
+      "message": "APITimeoutError - Request timed out.",
+      "llm_provider": "cohere",
+      "model": "command-a"
+    }
+  },
+  "expect": {
+    "error_class": "timeout",
+    "status_code": 408,
+    "provider_error_type": "Timeout",
+    "message_contains": "timed out"
+  }
+}

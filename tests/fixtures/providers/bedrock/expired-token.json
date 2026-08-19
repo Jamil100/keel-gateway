@@ -1,0 +1,26 @@
+{
+  "id": "bedrock-expired-token",
+  "provider": "bedrock",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. Hand-written from the AWS ExpiredTokenException shape. Bedrock credentials are STS session tokens that expire on a timer, so this is the auth_failure most likely to be seen in production - and D7 keeps it out of the breaker precisely because an expired token of ours says nothing about AWS's health.",
+  "exception": {
+    "module": "litellm",
+    "type": "AuthenticationError",
+    "kwargs": {
+      "message": "BedrockException - {\"__type\":\"ExpiredTokenException\",\"message\":\"The security token included in the request is expired.\"}",
+      "llm_provider": "bedrock",
+      "model": "anthropic.claude-sonnet-4"
+    },
+    "http": {
+      "status_code": 403,
+      "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-sonnet-4/converse"
+    }
+  },
+  "expect": {
+    "error_class": "auth_failure",
+    "status_code": 403,
+    "provider_error_type": "AuthenticationError",
+    "message_contains": "ExpiredTokenException"
+  }
+}

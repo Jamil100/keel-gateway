@@ -1,0 +1,22 @@
+{
+  "id": "cohere-rate-limit-wrapped",
+  "provider": "cohere",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. Reproduced by running litellm's own cohere mapper offline against a 429: its status arm has no 429 branch either, so throttling falls through to the same generic APIConnectionError as the bad-key case. Re-capture live under load before Phase 3 breaker tuning. Both server_error and rate_limit count toward the breaker (D7), so a misfire here changes a dashboard label, never a circuit decision.",
+  "exception": {
+    "module": "litellm",
+    "type": "APIConnectionError",
+    "kwargs": {
+      "message": "CohereException - {\"message\":\"You are being rate limited. Please wait and try again later.\"}",
+      "llm_provider": "cohere",
+      "model": "command-a"
+    }
+  },
+  "expect": {
+    "error_class": "rate_limit",
+    "status_code": 500,
+    "provider_error_type": "APIConnectionError",
+    "message_contains": "rate limited"
+  }
+}

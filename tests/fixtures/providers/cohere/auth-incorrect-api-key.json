@@ -1,0 +1,27 @@
+{
+  "id": "cohere-auth-incorrect-api-key",
+  "provider": "cohere",
+  "source": "captured",
+  "verified": true,
+  "captured_at": "2026-08-19",
+  "captured_with": {
+    "litellm": "1.97.0",
+    "openai": "2.54.0"
+  },
+  "note": "The P1-T7 live check, with a deliberately bogus COHERE_API_KEY. LiteLLM's _map_cohere_exception has no 401 branch, so this arrives as APIConnectionError with a synthetic status 500 rather than as AuthenticationError. The type table alone yields server_error; D7 counts that toward the breaker and excludes auth_failure, so unrefined this trips the Phase 3 breaker on a healthy provider. This fixture is the bug P2-T1 exists to fix. NOTE: 'message' below is the INNER message - LiteLLM prepends 'litellm.APIConnectionError: ' itself.",
+  "exception": {
+    "module": "litellm",
+    "type": "APIConnectionError",
+    "kwargs": {
+      "message": "CohereException - {\"message\":\"Incorrect API key provided: sk-***. You can find your API key at https://dashboard.cohere.com/api-keys.\"}",
+      "llm_provider": "cohere",
+      "model": "command-a"
+    }
+  },
+  "expect": {
+    "error_class": "auth_failure",
+    "status_code": 500,
+    "provider_error_type": "APIConnectionError",
+    "message_contains": "Incorrect API key provided"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "cohere-server-error-500",
+  "provider": "cohere",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. The benign 500 - an ordinary upstream fault with nothing in its body for a refinement rule to latch onto. It must stay server_error, which makes it the negative control for the Cohere rules: if a pattern is ever loosened enough to match this, the auth rule has become a liability.",
+  "exception": {
+    "module": "litellm",
+    "type": "InternalServerError",
+    "kwargs": {
+      "message": "CohereException - {\"message\":\"internal server error, please retry\"}",
+      "llm_provider": "cohere",
+      "model": "command-a"
+    }
+  },
+  "expect": {
+    "error_class": "server_error",
+    "status_code": 500,
+    "provider_error_type": "InternalServerError",
+    "message_contains": "internal server error"
+  }
+}

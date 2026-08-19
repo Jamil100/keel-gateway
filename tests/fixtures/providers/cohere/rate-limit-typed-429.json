@@ -1,0 +1,26 @@
+{
+  "id": "cohere-rate-limit-typed-429",
+  "provider": "cohere",
+  "source": "handwritten",
+  "verified": false,
+  "note": "UNVERIFIED. The well-behaved path, kept alongside the wrapped variant above: when LiteLLM does type a 429 correctly, the type table alone must be enough and no refinement should be needed to reach rate_limit.",
+  "exception": {
+    "module": "litellm",
+    "type": "RateLimitError",
+    "kwargs": {
+      "message": "CohereException - {\"message\":\"too many requests\"}",
+      "llm_provider": "cohere",
+      "model": "command-a"
+    },
+    "http": {
+      "status_code": 429,
+      "url": "https://api.cohere.com/v2/chat"
+    }
+  },
+  "expect": {
+    "error_class": "rate_limit",
+    "status_code": 429,
+    "provider_error_type": "RateLimitError",
+    "message_contains": "too many requests"
+  }
+}

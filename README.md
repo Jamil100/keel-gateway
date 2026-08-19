@@ -146,7 +146,20 @@ Where the PRD and the technical design conflict, the PRD wins.
 
 ## Status
 
-[PLACEHOLDER: current build phase and what works today — update as phases complete.]
+**Phase 1 (milestone M1) is complete.** Phase 2 — health tracking and observability — is next.
+
+What works today:
+
+- **`POST /v1/chat/completions`**, OpenAI-compatible. Request metadata arrives in `X-Keel-*` headers, with an `x_keel` body object as the fallback for clients that cannot set them. Untagged traffic is rejected with a 400 that lists *every* missing field at once, not the first.
+- **Config-driven routing.** Which provider serves a request is decided by the `preference` list for its request class in `config/keel.yaml`. Changing that order and restarting changes who serves — no code change. The response names the provider in `X-Keel-Provider`.
+- **Two providers**: Cohere via LiteLLM, and an in-process mock (ADR 0002) with a seeded, deterministic chaos model — latency distribution, error rate, and a weighted mix over the error taxonomy.
+- **A normalized error taxonomy.** Every provider failure is mapped to one of seven classes and rendered as the matching HTTP status (ADR 0006).
+- **Startup validation.** A config that does not validate, or a provider whose credentials are absent, fails the process rather than surfacing at the first request (NFR-4, ADR 0004).
+- **`GET /healthz`** for liveness.
+
+Not built yet: the circuit breaker and failover (Phase 3), Prometheus metrics and the Grafana board (Phase 2), cost attribution (Phase 4), the deferred queue (Phase 5), and the compose stack. The quickstart below is still a placeholder because the compose file lands in Phase 2.
+
+Run the test suite with `pip install -e ".[dev]" && pytest` — it needs no network, no Redis, and no API key.
 
 ## License
 

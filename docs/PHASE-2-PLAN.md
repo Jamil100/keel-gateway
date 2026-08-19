@@ -5,14 +5,14 @@
 **Last updated:** 2026-08-19
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 12.25h of 22.75h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ⬜ P2-T1 … P2-T6. Next up: **P2-T1 — Error normalization, per provider.**
+**Progress:** 14.75h of 23.25h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 · ⬜ P2-T2 … P2-T6. Next up: **P2-T2 — Redis bucketed sliding window.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`.
 
 Not yet built: health tracking, metrics, the compose stack.
 
@@ -136,19 +136,21 @@ The 0.5h overrun is **ADR 0006** — the status mapping the task bullets never m
 
 **Exit criterion:** drive load through mocks with a configured error rate and watch success rate, latency percentiles, and error taxonomy move on a Grafana board that was provisioned from version control, not clicked together.
 
-### P2-T1 — Error normalization, per provider
-**2.0h · FR-2.4**
+### ~~P2-T1 — Error normalization, per provider~~ ✅ **DONE**
+**2.5h (est. 2.0h) · FR-2.4**
 
-- Fill in `keel/providers/errors.py`: map each adapter's raw failures onto the §5.4 taxonomy. HTTP 429, `ThrottlingException`, and `RateLimitError` all become `RATE_LIMIT` — the breaker must not see one concept as three.
-- `tests/fixtures/providers/{cohere,azure,bedrock}/*.json` — captured error responses replayed offline (§7). Cohere fixtures can be captured live now. Azure and Bedrock fixtures are hand-written from published error shapes and re-captured in Phase 4 when access lands; **mark the hand-written ones as unverified inside the fixture file itself**, not in a commit message nobody reads.
-- Unmapped provider exceptions default to `SERVER_ERROR` and emit a `WARNING` naming the exception type, so mapping gaps surface instead of hiding inside a catch-all.
-- **One fixture is already known and worth capturing first.** The P1-T7 live check sent a deliberately bogus `COHERE_API_KEY` and got back `error_class: server_error`, not `auth_failure` — LiteLLM surfaces an incorrect Cohere key as `APIConnectionError` wrapping a `CohereException`, not as `AuthenticationError`, so the P1-T5 isinstance table never reaches its auth row. The captured body:
-  ```
-  litellm.APIConnectionError: CohereException - {"message":"Incorrect API key provided: ..."}
-  ```
-  This matters more than one misfiled class: **D7 excludes `AUTH_FAILURE` from the breaker and includes `SERVER_ERROR`**, so today a wrong key trips the Phase 3 breaker on a provider that is perfectly healthy. Fixing it means matching on the wrapped message or status rather than the exception type alone.
+The 0.5h overrun is **ADR 0007** and the live-capture script the task bullets never mention. See below.
 
-**Done when:** every fixture replays to its expected `ErrorClass` in a parametrized test.
+- ~~Fill in `keel/providers/errors.py`: map each adapter's raw failures onto the §5.4 taxonomy. HTTP 429, `ThrottlingException`, and `RateLimitError` all become `RATE_LIMIT` — the breaker must not see one concept as three.~~ ✅ **but in `keel/providers/normalize.py`, not `errors.py`** — **ADR 0007**. `errors.py` fixes the *vocabulary* and is imported transitively by the health window, the metrics catalogue, and the breaker; none of those should have to read a table about LiteLLM's exception tree to find out what `RATE_LIMIT` means. It is untouched by this task. `keel/providers/cohere.py` keeps `normalize_litellm_error` as a thin delegate supplying the Cohere identity, so the adapter and its 200 lines of existing tests are unchanged.
+- ~~`tests/fixtures/providers/{cohere,azure,bedrock}/*.json` — captured error responses replayed offline (§7) … **mark the hand-written ones as unverified inside the fixture file itself**.~~ ✅ 12 fixtures. `verified` is a **required** field cross-validated against `source`, so the two cannot disagree and neither can be forgotten — `extra="forbid"` plus a model validator means a hand-written fixture that omits it fails to parse. Discovery is a glob, so a new file is a new test case with no registration step; a separate non-parametrized guard asserts the corpus is non-empty and covers all three families, because `parametrize` over an empty list yields zero tests and a *green* suite.
+- ~~Unmapped provider exceptions default to `SERVER_ERROR` and emit a `WARNING` naming the exception type.~~ ✅ Unchanged from P1-T5, but now warned **before** refinement, so a class that refinement rescues still reports the type-table gap rather than hiding it.
+- ~~**One fixture is already known and worth capturing first** … Fixing it means matching on the wrapped message or status rather than the exception type alone.~~ ✅ Fixed, and the cause is worse than "LiteLLM does not raise `AuthenticationError`". `_map_cohere_exception` has **no 401 branch and no 429 branch**: a 401 satisfies its outer `hasattr(status_code)` guard, matches no inner arm, falls out of the chain without raising, and lands on `exception_type`'s generic `APIConnectionError`. **Matching on status is therefore impossible** — the wrapper carries a synthetic `500`, not the real `401` — so the rule matches on message alone.
+- **Beyond the bullet, and why (1):** message matching is the classic way an error map rots, so it is gated rather than trusted. **A refinement rule may only replace `SERVER_ERROR`** and can never override a specifically-typed classification (**ADR 0007**). That turns the layer's whole safety argument into one property a test asserts over the corpus, instead of a judgement call per pattern — and it fixes the *direction* of failure: because a rule can only add information, a LiteLLM reword makes it stop firing and land back on today's `SERVER_ERROR`, never on a new misclassification.
+- **Beyond the bullet, and why (2):** a real mapping gap found while pinning the table. `litellm.exceptions.OpenAIError` derives from `openai.OpenAIError`, which sits *above* `openai.APIError` — so it was the one member of `litellm.LITELLM_EXCEPTION_TYPES` an `APIError`-terminated table missed, falling to the unmapped default. A row was added, and a test now iterates LiteLLM's own published catalogue so the next addition fails CI rather than arriving as a production `WARNING`.
+- **Beyond the bullet, and why (3):** `scripts/capture_error_fixtures.py`, run deliberately and never by CI. A green replay proves the mapping still turns *this* text into *that* class; it can never prove Cohere still emits that text, because fixtures are frozen strings. This is the only thing that checks the other direction, and the §5 tripwire is why it is a script rather than a test.
+- **The known cost, recorded rather than hidden.** LiteLLM raises `ContentPolicyViolationError` only for bodies containing both `invalid_request_error` and `content_policy_violation`; Azure's `ResponsibleAIPolicyViolation` body contains neither, so an Azure content filter classes `BAD_REQUEST`. Correcting it needs a `BAD_REQUEST → CONTENT_FILTER` refinement, which the P2-T1 invariant forbids. D7 excludes both classes, so no breaker decision changes — only the M2 panel's label, for a provider with no adapter until Phase 4 (ADR 0004). The Azure fixture pins the **current** behaviour and says why, so widening the invariant fails that fixture and forces the decision into the open.
+
+**Done when:** ~~every fixture replays to its expected `ErrorClass` in a parametrized test.~~ ✅ Met — 65 tests (383 total, 2 skipped), suite 5.7s → 7.9s. Verified end-to-end through the real HTTP stack: a bad key now returns `error.keel.error_class: "auth_failure"` where it returned `"server_error"`, with the status still 503 (ADR 0006 maps status from the class, and both classes land there) and the message still naming `APIConnectionError`, so the raw cause stays diagnosable from one line.
 
 ### P2-T2 — Redis bucketed sliding window
 **2.0h · FR-3.1, FR-3.2, D3**
@@ -203,7 +205,7 @@ The remaining three panels — circuit state timeline, failover annotations, que
 
 **Done when:** on a clean machine, `docker compose up` → `python scripts/loadgen.py --rps 20 --error-rate 0.4` → all four panels move within 30 seconds, and the whole path from clone to moving dashboard is under five minutes. **This is the M2 exit criterion.**
 
-**Phase 2 total: 11.0h** — 1.0h over the roadmap's 10.0h, entirely the P2-T6 carry-over.
+**Phase 2 total: 11.5h** — 1.5h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1. Under the 16.5h tripwire.
 
 ---
 
@@ -222,6 +224,7 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | ~~Technical design §5.2 — note that the shipped config carries two providers until Phase 4~~ ✅ | With ADR 0004 |
 | ~~`docs/adr/0006-upstream-failures-map-to-http-status-by-normalized-error-class.md`~~ ✅ | With P1-T7 |
 | ~~ADR 0003 — note that `error.keel` is extensible; upstream errors add `provider` and `error_class`~~ ✅ | With ADR 0006 |
+| ~~`docs/adr/0007-message-refinement-may-only-replace-a-server-error.md`~~ ✅ | With P2-T1 |
 | ~~Technical design §8 repo layout — add `keel/clock.py`, `keel/api/app.py`, `scripts/`~~ ✅ | End of Phase 1 |
 | ~~README "Status" placeholder → what works today~~ ✅ (Phase 1) | End of each phase |
 | README "Quickstart" placeholder → real commands | P2-T6 |

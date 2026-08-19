@@ -500,7 +500,7 @@ Stated explicitly, because a reviewer will find them and it is better to have na
 | # | Question | Resolution status |
 |---|---|---|
 | Q1 | Which two fallbacks land first, and with which models? | Open — gated on access approvals |
-| Q2 | Does OpenAI-compatible shape carry Cohere tool-use and citation semantics? | Open — week 1 spike, may force an extension field |
+| Q2 | Does OpenAI-compatible shape carry Cohere tool-use and citation semantics? | **Resolved:** yes, no extension field — see [ADR 0005](adr/0005-cohere-tool-use-and-citations-need-no-extension-field.md). `tool_choice` forwarding is a separate, deferred gap |
 | Q3 | Health window fixed or per class? | **Resolved:** window is global, latency *budgets* are per class |
 | Q4 | Deferred worker separate or in-process? | **Resolved:** separate process, see §3 |
 | Q5 | Demo shows cross-vendor, sovereignty variant, or both? | Open — config supports both; decide at week 6 |

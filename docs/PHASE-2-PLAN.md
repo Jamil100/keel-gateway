@@ -5,16 +5,16 @@
 **Last updated:** 2026-08-18
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 9.25h of 22.75h. ✅ P1-T1 … P1-T5 · ⬜ P1-T6 … P2-T6. Next up: **P1-T6 — Static router and executor.**
+**Progress:** 10.25h of 22.75h. ✅ P1-T1 … P1-T6 · ⬜ P1-T7 … P2-T6. Next up: **P1-T7 — FastAPI app and the ingress endpoint.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`.
 
-Not yet built: FastAPI ingress, router, health tracking, metrics, the compose stack.
+Not yet built: FastAPI ingress, health tracking, metrics, the compose stack.
 
 This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~22.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
 
@@ -102,13 +102,16 @@ The 1.0h overrun is **ADR 0004** and everything it drags with it. The shipped `c
 
 **Done when:** ~~an offline test builds the registry from the shipped `config/keel.yaml` and asserts each provider maps to the right adapter class. Any live Cohere call is a `real_provider`-marked test excluded from CI.~~ ✅ Met — 74 tests (235 total, 1 skipped). Test-suite runtime went 0.9s → 5.2s: `import litellm` alone costs 4.5s, which is also why the adapter imports it lazily rather than at module scope. The error-mapping tests build **real** LiteLLM exceptions rather than stand-ins, which is what caught the wrong-root bug above.
 
-### P1-T6 — Static router and executor
-**1.0h**
+### ~~P1-T6 — Static router and executor~~ ✅ **DONE**
+**1.0h — met**
 
-- `keel/routing/router.py` — resolve the request class's `preference` list into an ordered candidate list. **No health awareness, no capability filter, no breaker gate.** Name those slots in the code with a comment pointing at Phase 3, so the seam is visible to the next reader rather than invented later.
-- `keel/routing/executor.py` — invoke candidate 1, apply `timeout_ms`, return the `ProviderResult`. This is the single call site P2-T2 hooks health recording into.
+- ~~`keel/routing/router.py` — resolve the request class's `preference` list into an ordered candidate list. **No health awareness, no capability filter, no breaker gate.** Name those slots in the code with a comment pointing at Phase 3, so the seam is visible to the next reader rather than invented later.~~ ✅ Three seams named in §5.7's order, capability filter **first** per D2. Returns a `tuple`, not the config's `list`: `KeelConfig` is frozen but pydantic does not freeze the list inside it, so handing it out would let a caller rewrite routing policy through the return value.
+- ~~`keel/routing/executor.py` — invoke candidate 1, apply `timeout_ms`, return the `ProviderResult`. This is the single call site P2-T2 hooks health recording into.~~ ✅ `asyncio.wait_for` above the adapter's own timeout — the backstop `keel/providers/cohere.py` already pointed at. `timeout_ms: None` (the mock, per §5.2) means *no* gateway deadline and is awaited unwrapped, never `wait_for(None)`.
+- **Composition decision:** the executor holds the router, so ingress makes one call. §4 draws them as separate participants and they stay separate objects — but Phase 3's failover loop and half-open re-gating both belong *inside* the executor, and the alternative would have straddled them across the ingress boundary P1-T7 is about to build.
+- **The one place the injected clock does not reach.** `wait_for` measures event-loop time, and no amount of `Clock` gets it to measure anything else: `ManualClock.sleep` advances time and returns on the same tick, so racing an attempt against `clock.sleep(timeout)` finishes both together *and* double-advances the clock. So the four timeout tests use `SystemClock` and a fake adapter awaiting a real `asyncio.sleep(50ms)` against a 5ms deadline. NFR-2 still holds — nothing calls `time.sleep`, and the whole real-time cost is under 0.1s. Everything else in the file stays on `ManualClock`.
+- **Beyond the bullet, and why:** on timeout the executor synthesizes the `ProviderResult` the adapter never got to return, classed `TIMEOUT` and tagged `provider_error_type="KeelExecutorTimeout"`. `wait_for` cancels the attempt, and both adapters use `except Exception` precisely so `CancelledError` passes through — so nothing below has described the failure and the executor must. The tag exists because a provider-side timeout arrives as LiteLLM's `Timeout` carrying *that* name, and "they were slow" versus "we were impatient" has to be answerable from one log line.
 
-**Done when:** table-driven tests over `(request_class) → ordered candidates` for all three shipped classes.
+**Done when:** ~~table-driven tests over `(request_class) → ordered candidates` for all three shipped classes.~~ ✅ Met — 32 tests (267 total, 1 skipped), suite 5.7s. The expected candidate lists are transcribed by hand rather than read back from the config, so the two must agree — same posture as the §5.4 table. Two tests assert the *absence* of behaviour and are meant to fail in Phase 3 rather than survive it: a `citations`-tagged request still sees `mock_chaos`, which lacks that capability, and a `SERVER_ERROR` whose own `retry_elsewhere` is `True` is returned rather than failed over. Pinning those makes Phase 3 a visible test edit instead of a silent change of meaning.
 
 ### P1-T7 — FastAPI app and the ingress endpoint
 **1.5h · FR-1.1**

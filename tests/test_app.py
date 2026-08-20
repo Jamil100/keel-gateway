@@ -40,7 +40,7 @@ from keel.api.app import create_app
 from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock, ManualClock
 from keel.config import ConfigError, KeelConfig, load_config
-from keel.health.window import HealthWindow
+from keel.health.window import HealthTracker
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.credentials import ProviderCredentials
 from keel.providers.errors import ErrorClass, NormalizedError
@@ -740,7 +740,7 @@ def test_the_config_and_registry_reach_app_state() -> None:
     assert isinstance(context, AppContext)
     assert isinstance(context.config, KeelConfig)
     assert set(context.registry) == {"cohere_primary", "mock_chaos"}
-    assert isinstance(context.window, HealthWindow)
+    assert isinstance(context.tracker, HealthTracker)
 
 
 def test_a_served_request_leaves_a_count_in_the_health_window() -> None:
@@ -767,7 +767,7 @@ def test_a_served_request_leaves_a_count_in_the_health_window() -> None:
     )
     with TestClient(app) as client:
         assert client.post(ENDPOINT, headers=HEADERS, json=BODY).status_code == 200
-        window = app.state.keel.window
+        window = app.state.keel.tracker
 
     counts = asyncio.run(window.read("cohere_primary"))
     assert counts is not None

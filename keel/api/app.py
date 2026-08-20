@@ -50,7 +50,7 @@ from keel.api.errors import (
 )
 from keel.clock import Clock, SystemClock
 from keel.config import DEFAULT_CONFIG_PATH, KeelConfig, load_config
-from keel.health.window import HealthWindow
+from keel.health.window import HealthTracker
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.credentials import ProviderCredentials
 from keel.providers.registry import build_registry
@@ -92,7 +92,7 @@ class AppContext:
     clock: Clock
     registry: Mapping[str, ProviderAdapter]
     executor: Executor
-    window: HealthWindow
+    tracker: HealthTracker
     """The health recorder. Held here as well as inside the executor because
     Phase 3's breaker and P2-T4's exporter both read it without going through an
     attempt, and one narrowed accessor beats four unchecked ``state`` reads."""
@@ -301,7 +301,7 @@ def create_app(
         # Redis restart into a gateway outage.
         owns_redis = redis is None
         client = create_redis_client() if redis is None else redis
-        window = HealthWindow(redis=client, breaker=config.breaker, clock=resolved_clock)
+        tracker = HealthTracker(redis=client, breaker=config.breaker, clock=resolved_clock)
 
         setattr(
             app.state,
@@ -315,9 +315,9 @@ def create_app(
                     config=config,
                     registry=adapters,
                     clock=resolved_clock,
-                    window=window,
+                    tracker=tracker,
                 ),
-                window=window,
+                tracker=tracker,
             ),
         )
 

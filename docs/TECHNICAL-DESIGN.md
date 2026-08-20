@@ -295,7 +295,9 @@ The health hash carries eight fields: `ok`, plus `err_` prefixed with each of th
 
 Buckets are fixed-width (5 s) and the window is the union of the last 12 buckets. This is a **sliding window of discrete buckets**, not a true continuous sliding window — a deliberate simplification. The alternative, a sorted set of individual events, gives exact windowing at the cost of O(n) memory per provider and a `ZREMRANGEBYSCORE` on every request. Bucket granularity introduces at most 5 s of staleness at the window edge, which is well inside the S2 target of "p95 reroute time ≤ 2× window length."
 
-**Percentiles.** Redis cannot compute percentiles natively. Latency samples are kept as a capped reservoir per bucket (e.g. 200 samples) and percentiles are computed in-process across merged buckets. This is approximate under high load. That is acceptable because the p95 figure here drives a *threshold comparison*, not a reported SLA — the authoritative latency numbers for the README come from Prometheus histograms, which are exported separately and not subject to reservoir sampling.
+**Percentiles.** Redis cannot compute percentiles natively. Latency samples are kept per bucket, capped at 200, and percentiles are computed in-process across merged buckets by **nearest rank** — so every figure reported is a latency some request actually experienced, not an interpolated midpoint. This is approximate under high load.
+
+**The cap is a recency cap, not reservoir sampling.** `LPUSH` + `LTRIM 0 199` keeps the 200 most *recent* samples in a bucket, not 200 drawn uniformly from it, so above 200 requests per bucket the percentiles describe the tail end of those five seconds. Measured against a lognormal spread with a 3 s median, that costs about **1% on p95 at ten times oversampling**, and it *understates* — a breaker reading these trips marginally later on latency, never earlier, which is the safe direction for a false signal. That is acceptable because the p95 figure here drives a *threshold comparison*, not a reported SLA — the authoritative latency numbers for the README come from Prometheus histograms, which are exported separately and not subject to reservoir sampling.
 
 ### 5.6 Circuit breaker
 
@@ -316,6 +318,8 @@ Three details carry most of the value:
 **Half-open is what makes it self-healing (FR-4.4).** In half-open, a configured fraction of eligible traffic is admitted to the recovering provider. A single probe failure reopens immediately rather than waiting out the window — recovery should be cautious and relapse should be instant. Without this state the breaker opens once and never closes, which is a kill switch, not resilience.
 
 **State is shared through Redis, not process memory.** State transitions use an atomic compare-and-set so that concurrent requests cannot each independently decide to trip the same breaker.
+
+**Open: the p95 trigger compares a per-provider figure against a per-class budget.** The health window and the latency samples are keyed by provider alone (§5.5) — there is no class dimension — while `latency_budget_p95_ms` is configured per request class. So one provider serving both `classification` (800 ms) and `batch_enrichment` (60000 ms) has **one p95 and two verdicts** on the same evidence at the same instant. Q3 resolved that the window is global and the budgets are per class, but not what this trip condition does with that. Phase 3 must decide, and the options are not free: giving the key a class dimension multiplies the keys and thins each bucket's samples, making the percentiles worse in the name of making them correct. P2-T3 records the per-provider figure and leaves the decision open rather than making it silently.
 
 ### 5.7 Router
 
@@ -462,7 +466,7 @@ keel/
 │   ├── api/               # app factory, ingress, envelope validation, chaos endpoints
 │   ├── routing/           # router, preference resolution, capability filter
 │   ├── providers/         # adapters + normalization
-│   ├── health/            # window tracker, breaker
+│   ├── health/            # window tracker (counts + latency), snapshot, breaker
 │   ├── queue/             # deferred worker, idempotency
 │   ├── cost/              # pricing table, attribution
 │   └── observability/     # metrics, structured logging

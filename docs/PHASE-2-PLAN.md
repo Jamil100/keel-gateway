@@ -5,16 +5,16 @@
 **Last updated:** 2026-08-19
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 17.5h of 23.25h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 · ✅ P2-T2 · ⬜ P2-T3 … P2-T6. Next up: **P2-T3 — Latency reservoir and percentiles.**
+**Progress:** 19.25h of 23.25h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 · ✅ P2-T2 · ✅ P2-T3 · ⬜ P2-T4 … P2-T6. Next up: **P2-T4 — Prometheus exporter.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`; P2-T2 adds `keel/health/window.py` and `keel/redis.py`, and wires the recording call into `keel/routing/executor.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`; P2-T2 adds `keel/health/window.py` and `keel/redis.py`, and wires the recording call into `keel/routing/executor.py`; P2-T3 adds `keel/health/latency.py` and `keel/health/snapshot.py`, and renames `HealthWindow` to `HealthTracker` now that it records both.
 
-Not yet built: latency percentiles, metrics, structured logging, the compose stack. Health *counting* landed with P2-T2; nothing reads it back yet, which is FR-3.4 working as intended.
+Not yet built: metrics, structured logging, the compose stack. FR-3.1 is complete as of P2-T3 — counts, error classes, and p50/p95/p99 are all recorded and readable through one `ProviderHealth` snapshot. **Nothing reads it back yet**, which is FR-3.4 working as intended: the breaker arrives in Phase 3, after P2-T4 and P2-T6 make these inputs visible.
 
 This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~22.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
 
@@ -168,14 +168,20 @@ The 0.75h overrun is **ADR 0008** and `keel/redis.py`, neither of which the task
 
 **Done when:** ~~`fakeredis` + `ManualClock` tests show counts entering the current bucket, the window rolling as time advances, and old buckets falling out of the merged view. Assert the 5s edge staleness explicitly.~~ ✅ Met — 34 tests (417 total, 2 skipped), suite 7.9s → 8.1s. The D3 edge is pinned at **both** ends: an event at `t=0.0` survives the full 60 s, and one at `t=4.9` is evicted at `t=60.0` having lived only 55.1 s — up to one bucket *early*, which is the direction the trade actually runs. Verified by mutation that the tests bite: widening the merge range by one bucket fails five of them, including the D3 pair. The §5.5 key is transcribed by hand as a literal string rather than rebuilt from the module, same posture as the §5.4 truth table.
 
-### P2-T3 — Latency reservoir and percentiles
-**1.5h · FR-3.1**
+### ~~P2-T3 — Latency reservoir and percentiles~~ ✅ **DONE**
+**1.75h (est. 1.5h) · FR-3.1**
 
-- `keel/health/latency.py` — capped reservoir per bucket at `keel:latency:{provider}:{bucket_epoch}` (LIST, `LPUSH` + `LTRIM` to 200, TTL 2× window).
-- `keel/health/snapshot.py` — `ProviderHealth` carrying success rate, error counts by class, and p50/p95/p99 computed in-process across merged buckets.
-- These percentiles are approximate under load. That is acceptable because they drive a threshold comparison in Phase 3, not a reported SLA. **The README's latency numbers come from the Prometheus histograms in P2-T4, not from here** — say so in the module docstring, so the two never get confused by someone looking for a number to quote.
+The 0.25h overrun is the `HealthWindow` → `HealthTracker` rename and its ripple through two modules and three test files — the consequence of the composition decision below, not of the task bullets.
 
-**Done when:** a known sample distribution yields the expected percentiles, `LTRIM` caps at 200 under 10k writes, and an empty window returns `None` rather than `0.0` — a provider with no traffic is *unknown*, not perfect.
+- ~~`keel/health/latency.py` — capped reservoir per bucket at `keel:latency:{provider}:{bucket_epoch}` (LIST, `LPUSH` + `LTRIM` to 200, TTL 2× window).~~ ✅ Pure functions only: the key, the staging, the parsing, and the percentile math. Nothing in it opens a connection, executes a pipeline, or catches a Redis error — `HealthTracker` does all three, once, inside the guard ADR 0008 already put there.
+- ~~`keel/health/snapshot.py` — `ProviderHealth` carrying success rate, error counts by class, and p50/p95/p99 computed in-process across merged buckets.~~ ✅ One constructor, `from_window(counts, samples)`, so a snapshot can never disagree with the window it came from. `sample_count` is carried alongside `total` because they legitimately differ under the cap, and a breaker should know how much evidence a percentile rests on.
+- ~~These percentiles are approximate … **the README's latency numbers come from the Prometheus histograms in P2-T4, not from here** — say so in the module docstring.~~ ✅ Said, in both new modules.
+- **Beyond the bullet, and why (1): one Redis round trip, not two.** The latency write is *staged onto the pipeline the counts already open* rather than issued by a peer recorder. A peer would have duplicated ~40 lines of bucket and guard machinery, and — sharper — **doubled the cost ADR 0008 measured**: two independent 250 ms time boxes instead of one, turning a ~220 ms Redis-down request into ~440 ms. Riding the same transaction also means a bucket's count and its sample land together or not at all. `HealthWindow` became `HealthTracker` as a consequence, which moves *toward* §5.5's own title for the component rather than away from it. The one-round-trip property is asserted by a counting stub, because one write and two produce identical Redis state and differ only in round trips — verified by mutation that splitting the write fails that test.
+- **Beyond the bullet, and why (2): nearest rank, not interpolation.** Every percentile returned is a latency some request actually experienced. `statistics.quantiles` reports the p50 of `[10,20,30,40]` as `25.0` — a number no attempt took — and raises below two samples, a case this hits constantly. Since these drive a threshold comparison rather than a published SLA, interpolation buys precision nothing consumes. Pinned by a test that fails if the method is ever swapped.
+- **The known cost, measured rather than assumed.** `LPUSH` + `LTRIM` is a **recency cap, not reservoir sampling** — it keeps the newest 200, not 200 drawn uniformly — so §5.5's word "reservoir" implies a property the implementation does not have. Measured against a lognormal spread with a 3 s median: 0.0% error at or under the cap, **-1.1% on p95 at 2.5× oversampling and -0.9% at 10×**. It *understates*, so a breaker reading these trips marginally later on latency and never earlier — the safe direction for a false signal. §5.5 now says all of this instead of "e.g. 200 samples".
+- **The open question, named rather than settled.** `latency_budget_p95_ms` is per **request class**; `keel:latency:{provider}:{bucket}` has no class dimension. One provider serving `classification` (800 ms) and `batch_enrichment` (60000 ms) therefore has **one p95 and two verdicts** on the same evidence at the same instant, and §5.6's `p95 > class budget` does not say which it means. Adding the dimension would triple the keys and thin each bucket's samples — making the percentiles worse in the name of making them correct — and deciding a breaker rule before the breaker exists is the FR-3.4 inversion this phase is ordered against. So P2-T3 records the per-provider figure and **writes the gap into §5.6 and `snapshot.py`**, with a test asserting the shape has no class dimension so Phase 3 must move the key schema, the trip condition, and that shape together or not at all.
+
+**Done when:** ~~a known sample distribution yields the expected percentiles, `LTRIM` caps at 200 under 10k writes, and an empty window returns `None` rather than `0.0`.~~ ✅ Met — 81 tests (470 total, 2 skipped), suite 8.1s → 12.7s. Percentiles were checked against an independently computed ground truth over 600 lognormal samples and matched exactly at p50, p95, and p99. Three flavours of "unknown" are distinguished and tested: Redis unreadable → `None`; reachable but idle → zeros with `success_rate is None`; counts without samples → real counts, `None` percentiles. Four mutations confirm the tests bite — dropping `LTRIM`, interpolating, returning `1.0` at zero volume, and splitting the write into two pipelines each fail at least one test. The Redis-down path was re-checked end to end: still 200, still one `WARNING` per attempt (**not two**), still ~0.23 s, unchanged from P2-T2.
 
 ### P2-T4 — Prometheus exporter
 **2.0h · FR-3.3**
@@ -211,7 +217,7 @@ The remaining three panels — circuit state timeline, failover annotations, que
 
 **Done when:** on a clean machine, `docker compose up` → `python scripts/loadgen.py --rps 20 --error-rate 0.4` → all four panels move within 30 seconds, and the whole path from clone to moving dashboard is under five minutes. **This is the M2 exit criterion.**
 
-**Phase 2 total: 12.25h** — 2.25h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1, 0.75h ADR 0008 and `keel/redis.py` in P2-T2. Under the 16.5h tripwire.
+**Phase 2 total: 12.5h** — 2.5h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1, 0.75h ADR 0008 and `keel/redis.py` in P2-T2, 0.25h the `HealthTracker` rename in P2-T3. Under the 16.5h tripwire.
 
 ---
 
@@ -233,6 +239,8 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | ~~`docs/adr/0007-message-refinement-may-only-replace-a-server-error.md`~~ ✅ | With P2-T1 |
 | ~~`docs/adr/0008-a-failed-health-write-is-dropped-not-raised.md`~~ ✅ | With P2-T2 |
 | ~~Technical design §5.5 — name all eight health-hash fields; §8 repo layout — add `keel/redis.py`~~ ✅ | With ADR 0008 |
+| ~~Technical design §5.5 — nearest-rank percentiles, and the cap is a recency cap with a measured bias~~ ✅ | With P2-T3 |
+| ~~Technical design §5.6 — the p95 trigger compares a per-provider figure against a per-class budget (open for Phase 3)~~ ✅ | With P2-T3 |
 | ~~Technical design §8 repo layout — add `keel/clock.py`, `keel/api/app.py`, `scripts/`~~ ✅ | End of Phase 1 |
 | ~~README "Status" placeholder → what works today~~ ✅ (Phase 1) | End of each phase |
 | README "Quickstart" placeholder → real commands | P2-T6 |
@@ -247,7 +255,7 @@ The README quickstart placeholder already says to fill it in during Phase 2 — 
 |---|---|
 | Mock adapter (P1-T4) exceeds 2.0h | Freeze at current capability immediately. Top-ranked PRD risk |
 | Either phase exceeds 1.5× budget (15h / 16.5h) | Apply the roadmap §4 descope ladder rather than extending the phase |
-| ~~Tempted to add the breaker "while I'm in here" during P2-T2~~ — held; P2-T2 records and merges, nothing reads it | Still live for P2-T3/T4: the inputs are not observable until `/metrics` and the board exist |
+| ~~Tempted to add the breaker "while I'm in here" during P2-T2~~ / ~~P2-T3~~ — held twice; FR-3.1 is now complete and still nothing reads it | Still live for P2-T4: the inputs are not observable until `/metrics` and the board exist |
 | Cohere spend approaches €10 across Phases 1–2 | Move all load generation to `mock_chaos` — the load driver defaults there anyway |
 
 ---

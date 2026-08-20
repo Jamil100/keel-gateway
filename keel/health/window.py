@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Annotated, Final
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -165,9 +165,29 @@ class HealthTracker:
     *range it merges over* rather than everything it holds.
     """
 
-    def __init__(self, *, redis: Redis, breaker: BreakerConfig, clock: Clock) -> None:
+    def __init__(
+        self,
+        *,
+        redis: Redis,
+        breaker: BreakerConfig,
+        clock: Clock,
+        on_write_dropped: Callable[[str], None] | None = None,
+    ) -> None:
+        """
+        :param on_write_dropped: called with the provider name each time a write is
+            lost. ADR 0008 named this as P2-T4's job — until a counter exists, a
+            dropped observation leaves nothing behind but a log line, and a
+            dashboard that looks clean because nothing was recorded is the failure
+            that ADR calls out by name.
+
+            A plain callback rather than a ``MetricsCatalogue`` so ``keel.health``
+            keeps its zero dependencies on ``keel.observability``: the health
+            window is imported by the breaker and the executor, and neither should
+            drag the exporter in behind it.
+        """
         self._redis = redis
         self._clock = clock
+        self._on_write_dropped = on_write_dropped
         self._bucket_seconds = breaker.bucket_seconds
         # config.py already guarantees the window is a whole multiple of the
         # bucket width (_check_window_divides_into_buckets), so this division is
@@ -225,6 +245,8 @@ class HealthTracker:
                 type(exc).__name__,
                 exc,
             )
+            if self._on_write_dropped is not None:
+                self._on_write_dropped(result.provider)
 
     async def read(self, provider: str) -> WindowCounts | None:
         """Merge the last ``window_seconds`` of buckets. **Never raises**.

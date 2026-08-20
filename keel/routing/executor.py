@@ -46,6 +46,7 @@ from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock
 from keel.config import KeelConfig
 from keel.health.window import HealthTracker
+from keel.observability.metrics import MetricsCatalogue
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.errors import ErrorClass, NormalizedError
 from keel.routing.router import Router
@@ -70,6 +71,7 @@ class Executor:
         registry: Mapping[str, ProviderAdapter],
         clock: Clock,
         tracker: HealthTracker,
+        metrics: MetricsCatalogue | None = None,
     ) -> None:
         # `tracker` is required rather than defaulting to None. An optional
         # recorder is one that can be omitted by accident, and the result would be
@@ -82,6 +84,10 @@ class Executor:
         self._registry = registry
         self._clock = clock
         self._tracker = tracker
+        # Optional, unlike `tracker`: metrics are observation, not
+        # correctness, and requiring one would churn every existing executor
+        # test for a counter none of them assert on.
+        self._metrics = metrics
 
     async def execute(self, envelope: RequestEnvelope) -> ProviderResult:
         """Run one attempt and return its outcome, success or failure.
@@ -125,6 +131,12 @@ class Executor:
         # round trip. Phase 3's breaker is the first thing that reads any of it
         # back; recording it here is what FR-3.4 means by observing first.
         await self._tracker.record(result)
+        if self._metrics is not None:
+            # Per *attempt*, which is why it sits here rather than at the HTTP
+            # boundary: Phase 3's failover loop makes several attempts per
+            # request, and a duration histogram that saw only the last one
+            # would hide the slow attempt that caused the failover.
+            self._metrics.observe_attempt(envelope, result)
 
         return result
 

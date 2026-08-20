@@ -360,22 +360,51 @@ def test_the_dashboard_provider_path_matches_the_compose_mount(compose: dict[str
     )
 
 
-def test_the_dashboard_has_the_four_panels_phase_2_can_fill(dashboard: dict[str, Any]) -> None:
-    """The remaining three of FR-7.1's seven land in Phase 6, when producers exist.
+def test_the_dashboard_has_a_panel_for_every_metric_something_produces(
+    dashboard: dict[str, Any],
+) -> None:
+    """A panel exists exactly when a producer for its metric exists — no earlier.
 
-    Building a circuit-state panel now would show a flat line that means "no
-    breaker" rather than "no trips", which is a worse lie than an absent panel.
+    This test was written in P2-T6 to be edited, and Phase 3 is the edit. It then
+    asserted that `circuit` and `failover` panels were **absent**, because a flat
+    line drawn before the breaker existed would have meant "no breaker" rather
+    than "no trips" — a worse lie than an absent panel. Phase 3 builds the
+    breaker, so `keel_breaker_state` at `0` now honestly reads as *closed* and
+    both panels have something true to draw.
+
+    `queue` and `cost` stay absent for exactly the same reason, until Phase 5 and
+    Phase 4 produce them. That is what keeps this a rule rather than a snapshot.
     """
     titles = [panel["title"] for panel in dashboard["panels"]]
+
     assert "RPS by provider" in titles
     assert "Error rate by normalized class" in titles
     assert "p95 latency by provider" in titles
     assert any("overhead" in title.lower() for title in titles)
+    assert any("circuit" in title.lower() for title in titles)
+    assert any("failover" in title.lower() for title in titles)
 
-    for absent in ("circuit", "failover", "queue", "cost"):
+    for absent in ("queue", "cost"):
         assert not any(absent in title.lower() for title in titles), (
             f"a {absent!r} panel exists but nothing produces its metric until a later phase"
         )
+
+
+def test_the_circuit_panel_maps_all_three_states(dashboard: dict[str, Any]) -> None:
+    """0/1/2 is the §6 encoding, and a timeline of bare integers is unreadable.
+
+    Without the value mappings the panel renders three indistinguishable numbers
+    where the demo needs "Closed → Open → Half-open → Closed" to be legible at a
+    glance. This is the panel the FR-7.4 video is built around.
+    """
+    (panel,) = [p for p in dashboard["panels"] if "circuit" in p["title"].lower()]
+    (mapping,) = panel["fieldConfig"]["defaults"]["mappings"]
+
+    assert {key: value["text"] for key, value in mapping["options"].items()} == {
+        "0": "Closed",
+        "1": "Half-open",
+        "2": "Open",
+    }
 
 
 def test_every_metric_the_dashboard_queries_actually_exists() -> None:

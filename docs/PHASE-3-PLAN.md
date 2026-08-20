@@ -23,6 +23,7 @@ This phase has more of its shape already sitting in the repo than either prior p
 - `keel/config.py`'s `BreakerConfig` is fully specified — `window_seconds`, `bucket_seconds`, `min_requests_in_window`, `error_rate_threshold`, `open_cooldown_seconds`, `half_open_probe_ratio`, `half_open_successes_to_close` — and validated at startup. Nothing reads it yet.
 - `keel/observability/metrics.py` already declares `keel_breaker_state`, `keel_breaker_transitions_total`, and `keel_failover_events_total`, primed at startup the same way the provider-keyed series were in P2-T4. Its module docstring says outright: "`keel_breaker_*` and `keel_failover_events_total` wait for Phase 3."
 - `keel/api/app.py` sets `X-Keel-Attempts` from a named constant, `PHASE_1_ATTEMPTS = 1` — a placeholder the P1-T7 notes already flag as the real count's future home.
+- **Added after this document was first written, and load-bearing for the M3 exit below.** P2-T5 shipped structured JSON logs correlated by `request_id` (`keel/observability/logging.py`), with an `attempt` field already on every `provider_attempt` line — fixed at `1` until this phase's loop counts for real, so a multi-attempt request threads through the logs with no new plumbing. P2-T6 shipped the compose stack, a provisioned Grafana board, `scripts/loadgen.py`, and — settling the open sequencing question it inherited — an env-gated `POST /chaos/{provider}` (**ADR 0010**). §5's exit check is written against all of that.
 
 Nothing here is undiscovered work. This phase is closing seams the prior two left open on purpose, per design principle 2 and FR-3.4: observe before you react.
 
@@ -61,7 +62,7 @@ Production draws `random_source.draw() < half_open_probe_ratio` at gate time; a 
 
 **Exit criterion (roadmap):** with the chaos-configured mock degrading, traffic reroutes automatically and the breaker closes again unattended once the mock recovers. Circuit state timeline panel shows the full shape.
 
-The circuit-state-timeline panel itself is Phase 2's compose/Grafana work, not this phase's to build — this phase's job is making the state machine and the metrics it emits actually correct, so that whenever that panel exists it has something true to draw.
+**The circuit-state-timeline panel is this phase's to build**, which is a correction to what this document originally said. It assumed Phase 2 would build it; P2-T6 deliberately deferred it — *"building them now would show flat lines meaning 'no breaker' rather than 'no trips', which is a worse lie than an absent panel"* — and `tests/test_deploy_assets.py` asserts it is absent. That deferral was right and it makes this phase the panel's natural home: `0` only honestly reads as *closed* once a breaker exists to close. `keel_breaker_state` is already primed at `0` for every configured provider, so the panel has data the moment the state machine produces a transition. It lands with P3-T6, and the test that currently asserts its absence is edited in the same commit — that test was written to be edited.
 
 ### P3-T1 — Capability filter and the "no candidate" status split
 **~1.5h · FR-1.5, FR-2.5, FR-4.6**
@@ -132,12 +133,15 @@ The circuit-state-timeline panel itself is Phase 2's compose/Grafana work, not t
 
 Not a separate phase. Each ships in the same commit as the code that makes it true.
 
+**The three ADRs below are numbered 0011–0013, not 0010–0012.** `docs/adr/0010` was taken by P2-T6's chaos-endpoint decision, which landed after this document was written. `docs/adr/README.md` is explicit that numbers are monotonic and never reused, since a reused number breaks every reference to it.
+
 | Change | Trigger |
 |---|---|
-| `docs/adr/0010-the-p95-trip-condition-compares-against-the-tightest-class-budget.md` | With P3-T3 |
-| `docs/adr/0011-breaker-error-rate-excludes-non-breaker-classes-from-numerator-and-denominator.md` | With P3-T3 |
-| `docs/adr/0012-capability-exhaustion-and-provider-exhaustion-return-different-statuses.md` | With P3-T1 |
-| Technical design §5.6 — replace the open "Phase 3 must decide" note with the D-F resolution and its named cost | With ADR 0010 |
+| `docs/adr/0011-the-p95-trip-condition-compares-against-the-tightest-class-budget.md` | With P3-T3 |
+| `docs/adr/0012-breaker-error-rate-excludes-non-breaker-classes-from-numerator-and-denominator.md` | With P3-T3 |
+| `docs/adr/0013-capability-exhaustion-and-provider-exhaustion-return-different-statuses.md` | With P3-T1 |
+| `deploy/grafana/dashboards/keel-health.json` — the circuit-state timeline panel, and the `tests/test_deploy_assets.py` absence check it inverts | With P3-T6 |
+| Technical design §5.6 — replace the open "Phase 3 must decide" note with the D-F resolution and its named cost | With ADR 0011 |
 | Technical design §5.7 — split the flowchart's shared `DEGRADE` diamond into the three D-D moments, with their distinct statuses | With P3-T1 / P3-T4 |
 | Technical design §8 repo layout — add `keel/health/breaker.py` and the `RandomSource` neighbor to `keel/clock.py` | With P3-T2 |
 | README "Status" — Phase 3 complete, M3 met; update "Not built yet" list | End of phase |
@@ -161,24 +165,73 @@ Not a separate phase. Each ships in the same commit as the code that makes it tr
 **Every task:**
 
 ```bash
-ruff check . && mypy --strict keel && pytest
+ruff check . && mypy --strict keel scripts && pytest
 ```
 
 The full suite must run with no network and no Redis (NFR-2): `fakeredis` for breaker and health tests, `ManualClock` for anything time-dependent, a scripted `RandomSource` for probe-admission tests.
 
 **M3 exit:**
 
-There is no chaos-injection endpoint yet (`FR-7.2` is Phase 6) and no compose stack or dashboard in this repo to open, so the exit check is the test suite plus a minimal manual smoke pass rather than a scripted load run:
+`P3-T6`'s scripted scenario remains the **authoritative** proof — it runs under `ManualClock`
+with no real waiting, so it is deterministic and runs in CI on every push:
 
 ```bash
-pytest                          # includes P3-T6's end-to-end scripted scenario —
-                                 # this is the actual proof of the M3 exit criterion
+pytest                          # includes P3-T6's end-to-end state-machine scenario
+```
 
-uvicorn keel.api.app:app --port 8080
+The *demonstrable* proof is now a real scripted run, which it could not be when this document
+was written: P2-T6 landed the compose stack, the provisioned board, `scripts/loadgen.py`, and
+the env-gated chaos endpoint (**ADR 0010**). The whole M3 exit criterion can be driven live:
+
+```bash
+docker compose up -d
+
+# 1. Healthy. Breaker closed, one attempt per request.
+python scripts/loadgen.py --rps 20 --duration 60 --error-rate 0.0
+
+# 2. Degrade the provider under load, without restarting anything.
+curl -XPOST localhost:8080/chaos/mock_chaos \
+  -H 'Content-Type: application/json' -d '{"error_rate": 1.0}'
+#    -> error rate climbs, the breaker trips, traffic reroutes,
+#       X-Keel-Attempts goes above 1, and the circuit-state panel steps 0 -> 2
+
+# 3. Recover it, and touch nothing else.
+curl -XPOST localhost:8080/chaos/mock_chaos \
+  -H 'Content-Type: application/json' -d '{"error_rate": 0.0}'
+#    -> cooldown expires, half-open probes are admitted, N successes close it
+#       unattended, and the panel steps 2 -> 1 -> 0
+```
+
+Open Grafana at `localhost:3000` (anonymous viewer, no login) and watch the circuit-state
+timeline render the full shape — trip, flat open period, half-open probes, close. That shape
+is the roadmap's stated M3 exit criterion, and it is also a dry run for the FR-7.4 demo video,
+which is the same sequence recorded.
+
+Confirm the three metrics this phase produces for the first time have real series rather than
+primed zeros:
+
+```bash
 curl -s localhost:8080/metrics | grep -E \
   'keel_breaker_state|keel_breaker_transitions_total|keel_failover_events_total'
 ```
 
-Expect the three series to appear, primed at their startup defaults (`keel_breaker_state` at `0` — closed — for every configured provider; the two counters absent until something has transitioned or failed over, per the "declaring is not enough" rule from P2-T4). A normal request through `mock_chaos` should still return `200` with `X-Keel-Attempts: 1` unchanged, confirming the new loop did not alter the healthy path.
+`keel_breaker_state` is primed at `0` for every provider from startup (P2-T4's "declaring is
+not enough" rule); the two counters are **absent until something has actually transitioned or
+failed over**, so their appearance is itself evidence rather than decoration.
 
-The real exit evidence — a degrading provider tripping its breaker, traffic rerouting, and an unattended close once it recovers — is P3-T6's scripted scenario, run under `ManualClock` with no real waiting. A dashboard that can show this live to a reviewer is Phase 2's compose/Grafana work catching up to what this phase makes true, not something this phase can produce on its own.
+Finally, the logs should tell the same story from one `request_id` (§6.1): a failed-over
+request emits two `provider_attempt` lines with `attempt` 1 and 2, naming different providers,
+and one `request_completed`.
+
+```bash
+docker compose logs keel-gateway | grep '"event": "provider_attempt"'
+```
+
+**Carried over from P2-T6, and this is the phase to clear it.** The compose stack has been
+written and statically asserted but **never actually run** — the machine it was built on has no
+Docker. Before P3-T1, bring it up once: it validates the untested build, healthchecks, and
+`depends_on` ordering while the change is still fresh, and it captures the two numbers P2-T6
+could not — **S8**, the cold start from `git clone` against the five-minute target, and **S5
+with Redis up**, still unmeasured. Both P2-T4 and P2-T6 measured ~150 ms of overhead with Redis
+*down*; single-digit milliseconds is the expectation once it is up. Record the real numbers in
+P2-T6's card, whatever they are.

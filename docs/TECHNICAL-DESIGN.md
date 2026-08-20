@@ -406,6 +406,22 @@ Computation happens *after* the response is returned to the client, to protect t
 
 `keel_gateway_overhead_seconds` is separate from total duration specifically so S5 can be measured rather than asserted.
 
+**Label spelling.** The table is authoritative: the request-class label is `class`, not `request_class`, which is what §5.10's prose calls it. `outcome` takes exactly two values, `ok` and `error` — the taxonomy split lives on `keel_provider_errors_total{error_class}`, which ADR 0006 makes the dashboards' source precisely so they never depend on the HTTP status mapping.
+
+**`tenant` and `feature` are capped at 64 distinct values each, with the rest recorded as `other` (ADR 0009).** Both arrive as unvalidated client headers, and `prometheus_client` never evicts a series, so uncapped they are unbounded memory driven by an unauthenticated caller — measured at 706 bytes retained per distinct value. A per-tenant panel therefore shows nothing for a tenant that landed in the overflow bucket.
+
+**Bucket boundaries.** Not the library defaults, which cannot serve either histogram:
+
+| Histogram | Buckets | Why |
+|---|---|---|
+| `keel_gateway_overhead_seconds` | 1, 2.5, 5, 7.5, 10, **15**, 25, 50, 100, 250, 500, 1000 ms | 15 ms is an exact edge, so S5 is read directly rather than interpolated. The defaults step 10 ms straight to 25 ms, which straddles the target and makes 12 ms indistinguishable from 24 ms |
+| `keel_request_duration_seconds` | 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120 s | The defaults stop at 10 s while `batch_enrichment`'s budget is 60 s, so every slow call — the ones a budget exists to notice — would share the `+Inf` bucket |
+| `keel_queue_job_age_seconds` | 1, 5, 15, 60, 300, 900, 3600, 21600 s | Queue-drain scale rather than request latency. Revisit in Phase 5 against a real drain rate |
+
+**One metric is exported that this table does not list.** `keel_health_writes_dropped_total{provider}` counts health observations lost because Redis could not be written. ADR 0008 asked for it by name — without it a gateway whose window is quietly emptying looks identical to a healthy one, and the only evidence is a log line.
+
+**Provider-keyed series are created at startup, at zero.** A labelled metric that nothing has produced exports its `# TYPE` line and no series at all, so a Grafana panel over it reads "No data" rather than a flat zero. The metrics whose label sets are knowable from config are therefore primed, which is what lets the Phase 3–5 panels be built once and simply sit flat.
+
 **Dashboard panels** (FR-7.1): RPS by provider · error rate by normalized class · p95 latency by provider · circuit state timeline · failover event annotations · queue depth · cost per hour by tenant and by feature.
 
 The circuit state timeline is the panel the demo video is built around — it renders the trip, the flat open period, the half-open probes, and the close as one readable shape.
@@ -469,7 +485,8 @@ keel/
 │   ├── health/            # window tracker (counts + latency), snapshot, breaker
 │   ├── queue/             # deferred worker, idempotency
 │   ├── cost/              # pricing table, attribution
-│   └── observability/     # metrics, structured logging
+│   └── observability/     # metrics exporter (§6 catalogue), overhead middleware,
+│                          #   structured logging
 ├── config/keel.yaml
 ├── deploy/                # compose, prometheus, grafana provisioning
 ├── scripts/               # loadgen and other operator-facing drivers

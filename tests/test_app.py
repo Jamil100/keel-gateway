@@ -694,12 +694,15 @@ def test_the_module_level_app_exists_for_uvicorn_and_reads_no_config_at_import_t
     assert not hasattr(module_level_app.state, "keel")
 
 
-def test_the_route_table_is_exactly_the_two_endpoints_phase_1_ships() -> None:
+def test_the_route_table_is_exactly_the_three_endpoints_phase_2_ships() -> None:
     """Anti-scope-creep, asserted rather than remembered.
 
-    `/metrics` is P2-T4 and `/chaos` is Phase 6; neither is here yet. Filtering
-    to `APIRoute` drops FastAPI's own `/docs`, `/redoc`, and `/openapi.json`,
-    which are plain Starlette routes and are deliberately left switched on.
+    `/metrics` arrived with P2-T4, which is why this test was written to be edited
+    rather than to survive. `/chaos` is still Phase 6 and must not appear early —
+    P2-T6 has an open question about landing a minimal chaos endpoint for
+    `loadgen`, and this is what makes that a visible decision rather than a quiet
+    one. Filtering to `APIRoute` drops FastAPI's own `/docs`, `/redoc`, and
+    `/openapi.json`, which are plain Starlette routes and deliberately left on.
     """
     routes = {
         (route.path, tuple(sorted(route.methods)))
@@ -707,7 +710,11 @@ def test_the_route_table_is_exactly_the_two_endpoints_phase_1_ships() -> None:
         if isinstance(route, APIRoute)
     }
 
-    assert routes == {("/v1/chat/completions", ("POST",)), ("/healthz", ("GET",))}
+    assert routes == {
+        ("/v1/chat/completions", ("POST",)),
+        ("/healthz", ("GET",)),
+        ("/metrics", ("GET",)),
+    }
 
 
 # ---- Liveness ----
@@ -773,6 +780,130 @@ def test_a_served_request_leaves_a_count_in_the_health_window() -> None:
     assert counts is not None
     assert counts.ok == 1
     assert counts.total == 1
+
+
+# ---- /metrics and the exporter wiring (P2-T4) ----
+
+
+def test_the_metrics_endpoint_serves_the_catalogue_in_prometheus_format() -> None:
+    """The M2 verification step is literally `curl localhost:8080/metrics`.
+
+    The content type is asserted loosely on purpose: prometheus-client 0.26 serves
+    `version=1.0.0` where older examples show `0.0.4`, and pinning the exact string
+    would make a library upgrade look like a gateway bug.
+    """
+    with gateway(SHIPPED_CONFIG) as (client, _):
+        response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "keel_requests_total" in response.text
+
+
+def test_every_section_6_metric_reaches_the_scrape_endpoint() -> None:
+    """The task's own bar: every §6 metric appears in `/metrics`.
+
+    Asserted through the real HTTP stack rather than off the catalogue object, so a
+    catalogue that is built but never reaches `AppContext` — or a `/metrics` route
+    rendering the wrong registry — fails here. `tests/test_metrics.py` pins the
+    labels; this pins that the thing is actually wired.
+    """
+    expected = {
+        "keel_requests_total",
+        "keel_request_duration_seconds",
+        "keel_gateway_overhead_seconds",
+        "keel_provider_errors_total",
+        "keel_breaker_state",
+        "keel_breaker_transitions_total",
+        "keel_failover_events_total",
+        "keel_hedge_attempts_total",
+        "keel_queue_depth",
+        "keel_queue_job_age_seconds",
+        "keel_cost_micros_total",
+    }
+
+    with gateway(SHIPPED_CONFIG) as (client, _):
+        text = client.get("/metrics").text
+
+    missing = {name for name in expected if name not in text}
+    assert not missing, f"§6 metrics absent from /metrics: {sorted(missing)}"
+
+
+def test_a_served_request_moves_the_request_counter_and_the_histograms() -> None:
+    """End to end: ingress → executor → catalogue → scrape.
+
+    The one test that would fail if `observe_request` or `observe_attempt` were
+    never called, however correct the catalogue itself is.
+    """
+    with gateway(SHIPPED_CONFIG) as (client, _):
+        assert client.post(ENDPOINT, headers=HEADERS, json=BODY).status_code == 200
+        text = client.get("/metrics").text
+
+    assert 'tenant="acme"' in text
+    assert 'feature="support-summary"' in text
+    assert 'provider="cohere_primary"' in text
+    assert 'outcome="ok"' in text
+    assert 'keel_request_duration_seconds_count{class="interactive_chat"' in text
+
+
+def test_a_failed_upstream_is_counted_as_an_error_with_its_taxonomy_class() -> None:
+    """The M2 error-rate panel's data, split by class rather than by HTTP status.
+
+    ADR 0006 says the metrics are labelled by `ErrorClass` "precisely so the
+    dashboards never depend on this mapping", so the taxonomy label is what is
+    asserted here rather than the 429 the client saw.
+    """
+    stub = FailingCohere(ErrorClass.RATE_LIMIT)
+
+    with gateway(SHIPPED_CONFIG, stub=stub) as (client, _):
+        assert client.post(ENDPOINT, headers=HEADERS, json=BODY).status_code == 429
+        text = client.get("/metrics").text
+
+    assert 'outcome="error"' in text
+    assert 'keel_provider_errors_total{error_class="rate_limit",provider="cohere_primary"}' in text
+
+
+def test_the_breaker_gauge_is_flat_zero_rather_than_absent_before_phase_3() -> None:
+    """Declared *and* primed, which are different things.
+
+    A labelled metric with no series exports its `# TYPE` line and nothing else, so
+    a Grafana panel over it reads "No data" rather than a flat zero. P2-T4's whole
+    justification for declaring the Phase 3–5 metrics now is that those panels are
+    built once and simply sit flat — which only holds if the series exist.
+    """
+    with gateway(SHIPPED_CONFIG) as (client, _):
+        text = client.get("/metrics").text
+
+    assert 'keel_breaker_state{provider="cohere_primary"} 0.0' in text
+    assert 'keel_breaker_state{provider="mock_chaos"} 0.0' in text
+
+
+def test_the_metrics_endpoint_itself_is_not_counted_as_a_request() -> None:
+    """`/metrics` is not ingress. Counting scrapes would inflate RPS by the scrape rate.
+
+    At P2-T6's ≤5 s scrape interval against a quiet gateway, that would be most of
+    the RPS panel.
+    """
+    with gateway(SHIPPED_CONFIG) as (client, _):
+        client.get("/metrics")
+        client.get("/metrics")
+        text = client.get("/metrics").text
+
+    assert "keel_requests_total{" not in text, "no request series should exist yet"
+
+
+def test_an_envelope_rejection_records_no_overhead() -> None:
+    """A 400 never reached a provider, so it is not what S5 measures.
+
+    Counting it would let a client move the gateway's own latency figure by sending
+    malformed requests.
+    """
+    with gateway(SHIPPED_CONFIG) as (client, _):
+        bad = {key: value for key, value in HEADERS.items() if key != "X-Keel-Tenant"}
+        assert client.post(ENDPOINT, headers=bad, json=BODY).status_code == 400
+        text = client.get("/metrics").text
+
+    assert "keel_gateway_overhead_seconds_count{" not in text
 
 
 def test_unknown_json_paths_are_a_404_rather_than_an_ingress_attempt() -> None:

@@ -18,8 +18,8 @@ then never accepts a request against a config it could not validate — which is
 the whole argument of ADR 0004, applied one level up: a gateway that starts
 "successfully" and fails every request is worse than one that refuses to start.
 
-**What is deliberately absent.** ``/metrics`` and the overhead middleware are
-P2-T4; structured logging is P2-T5; ``X-Keel-Cost-Micros`` waits for the Phase 4
+**What is deliberately absent.** Structured logging is P2-T5;
+``X-Keel-Cost-Micros`` waits for the Phase 4
 cost engine, because emitting a zero would be a cost claim and a wrong one; the
 ``422`` for no capable provider (§5.7) and a real attempt count arrive with Phase
 3's failover loop; §4's ``202`` deferrable-enqueue branch is Phase 5.
@@ -51,6 +51,12 @@ from keel.api.errors import (
 from keel.clock import Clock, SystemClock
 from keel.config import DEFAULT_CONFIG_PATH, KeelConfig, load_config
 from keel.health.window import HealthTracker
+from keel.observability.metrics import MetricsCatalogue
+from keel.observability.middleware import (
+    PROVIDER_SECONDS_ATTR,
+    REQUEST_CLASS_ATTR,
+    OverheadMiddleware,
+)
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.credentials import ProviderCredentials
 from keel.providers.registry import build_registry
@@ -92,6 +98,13 @@ class AppContext:
     clock: Clock
     registry: Mapping[str, ProviderAdapter]
     executor: Executor
+    metrics: MetricsCatalogue
+    """The §6 catalogue and its registry, built once per app.
+
+    Per app rather than module-global because ``prometheus_client`` refuses a
+    second registration of the same metric name, and the test suite builds many
+    apps in one session."""
+
     tracker: HealthTracker
     """The health recorder. Held here as well as inside the executor because
     Phase 3's breaker and P2-T4's exporter both read it without going through an
@@ -258,6 +271,7 @@ def create_app(
     registry: Mapping[str, ProviderAdapter] | None = None,
     credentials: ProviderCredentials | None = None,
     redis: Redis | None = None,
+    metrics: MetricsCatalogue | None = None,
 ) -> FastAPI:
     """Build the gateway app. Does no I/O — every read happens in the lifespan.
 
@@ -270,6 +284,8 @@ def create_app(
         inside the lifespan, so the ADR 0004 startup guarantee applies.
     :param credentials: passed to ``build_registry``; ignored when ``registry``
         is supplied.
+    :param metrics: a pre-built §6 catalogue. Supply one to read counters back
+        in a test; otherwise the lifespan builds a fresh registry per app.
     :param redis: a pre-built client, for tests that must not touch a socket.
         When omitted the lifespan builds one from ``REDIS_URL`` and closes it on
         shutdown; an injected client is left open, because it belongs to the
@@ -301,7 +317,20 @@ def create_app(
         # Redis restart into a gateway outage.
         owns_redis = redis is None
         client = create_redis_client() if redis is None else redis
-        tracker = HealthTracker(redis=client, breaker=config.breaker, clock=resolved_clock)
+
+        # The catalogue itself is built below, before the middleware stack is
+        # assembled. Priming happens here instead, because it needs the provider
+        # names and the config is deliberately not read until startup: it makes the
+        # provider-keyed series read a flat zero rather than "no data" before Phase
+        # 3 produces them, which is the whole reason P2-T4 declares them up front.
+        catalogue.prime(config.providers)
+
+        tracker = HealthTracker(
+            redis=client,
+            breaker=config.breaker,
+            clock=resolved_clock,
+            on_write_dropped=catalogue.observe_dropped_health_write,
+        )
 
         setattr(
             app.state,
@@ -316,7 +345,9 @@ def create_app(
                     registry=adapters,
                     clock=resolved_clock,
                     tracker=tracker,
+                    metrics=catalogue,
                 ),
+                metrics=catalogue,
                 tracker=tracker,
             ),
         )
@@ -330,12 +361,23 @@ def create_app(
         if owns_redis:
             await client.aclose()
 
+    # Built here, not in the lifespan: Starlette assembles the middleware stack on
+    # the first request and forbids additions after that, so the overhead
+    # middleware needs the catalogue now. Construction is pure in-memory — no
+    # config, no socket — so `create_app` stays I/O-free (the module-level `app`
+    # depends on that). The provider names it primes with arrive at startup.
+    catalogue = metrics if metrics is not None else MetricsCatalogue()
+
     app = FastAPI(
         title="Keel",
         summary="A self-healing LLM gateway with an OpenAI-compatible surface.",
         lifespan=lifespan,
     )
     app.add_exception_handler(KeelError, keel_error_handler)
+
+    # Outermost by construction, so the wall clock it measures includes every
+    # other layer — which is what S5 means by gateway overhead.
+    app.add_middleware(OverheadMiddleware, metrics=catalogue)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
@@ -369,6 +411,21 @@ def create_app(
 
         result = await context.executor.execute(envelope)
 
+        # The handoff to the overhead middleware, which sees only a Request and a
+        # Response and so can reach neither the envelope nor the result. Set on
+        # both branches below by being set here, before either is taken — an
+        # upstream failure consumed gateway time exactly like a success did.
+        #
+        # `setattr` with the shared constants rather than literal attribute names,
+        # so the writer here and the reader there cannot drift apart into a handoff
+        # that silently reads empty and records no overhead at all.
+        setattr(request.state, REQUEST_CLASS_ATTR, envelope.request_class)
+        setattr(request.state, PROVIDER_SECONDS_ATTR, result.latency_ms / 1000.0)
+
+        context.metrics.observe_request(
+            envelope=envelope, provider=result.provider, ok=result.ok
+        )
+
         # Set on the failure path too. A 503 that will not say which provider it
         # tried is useless in the demo these headers exist for (§4), and the
         # exception handler has no result to read a provider name from — which is
@@ -401,6 +458,25 @@ def create_app(
         something for it to answer.
         """
         return JSONResponse({"status": "ok"})
+
+    @app.get("/metrics")
+    async def metrics_endpoint(request: Request) -> Response:
+        """The Prometheus scrape endpoint (FR-3.3, §6).
+
+        Unauthenticated and on the main port, because that is what every document
+        describing it says: §8 draws one `PR -->|scrape| GW` edge, the compose
+        stack publishes one gateway port, and the M2 verification step is literally
+        `curl localhost:8080/metrics`. The gateway has no authentication at all
+        (§10 records that as a known limitation), so adding some here would be an
+        undocumented departure that also breaks that verification command.
+
+        Reads through :meth:`MetricsCatalogue.render` rather than calling
+        ``generate_latest`` here, so the content type travels with the body — it is
+        ``version=1.0.0`` in prometheus-client 0.26, not the ``0.0.4`` that older
+        examples show, and a scraper given the wrong one may refuse the payload.
+        """
+        body, content_type = _context(request).metrics.render()
+        return Response(content=body, media_type=content_type)
 
     return app
 

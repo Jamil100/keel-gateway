@@ -457,9 +457,9 @@ Event names are stable and few: `provider_attempt` (one per attempt, from the ex
 | Breaker state machine | Pure unit tests against an injectable `Clock`. Time is advanced explicitly; no `sleep` in tests |
 | Router | Table-driven tests over capability sets × breaker states × preference lists |
 | Error normalization | Fixture responses captured from each real provider, replayed offline |
-| Integration | Full compose stack with mock providers only; chaos scripted through the chaos API |
+| Integration | Full compose stack with mock providers only; chaos scripted through the chaos API. **The stack is not a test dependency** — the suite runs with no Docker, no network, and no Redis (NFR-2), and `tests/test_deploy_assets.py` checks the compose assets as files instead |
 | Idempotency | Concurrent duplicate submissions asserting exactly-once side effects |
-| Load | Locust or k6 against mocks, to validate S5 without spending money (NFR-3) |
+| Load | `scripts/loadgen.py` — an async driver against the mock, to validate S5 without spending money (NFR-3). Locust and k6 were the original intent; the driver has to set `X-Keel-*` metadata per request, drive the chaos endpoint between phases, and add nothing to the S8 install, and `httpx` was already a dependency |
 | Real-provider smoke | Small, explicitly-marked suite, excluded from CI by default |
 
 The injectable clock is the highest-leverage decision in this table. Every timing behaviour in the system — window rolling, cooldown expiry, hedge triggers, backoff — becomes deterministic, and the test suite runs in seconds rather than minutes.
@@ -487,7 +487,19 @@ flowchart TB
 
 There is no `mock-provider` container: the mock is an in-process adapter inside the gateway (**ADR 0002**), which is why §3 draws it as `AD4["Mock adapter"]` rather than as a service. It remains a permanent component — only the container is gone.
 
+**The diagram is the end state; the shipped stack is a subset.** `keel-worker` is drawn above and does not exist yet — the deferred queue is Phase 5 — so `docker-compose.yml` declares four services, not five. The `.env` edge is also weaker than drawn: compose loads `.env` optionally, because the stack's default config needs no credentials at all (below).
+
 `docker compose up` must reach a healthy dashboard in under five minutes on a clean machine (S8). Grafana dashboards and Prometheus scrape config are provisioned as version-controlled files, not configured by hand — a reviewer who has to build panels themselves will not.
+
+**The compose file sits at the repo root**, not under `deploy/`. NFR-1 and S8 both specify the bare command `docker compose up`, which resolves only a file in the working directory; everything that command *reads* — the Dockerfile, the demo config, the Prometheus scrape config, the Grafana provisioning — lives under `deploy/`.
+
+**The stack runs against `deploy/keel.demo.yaml`, not `config/keel.yaml`.** That file declares `mock_chaos` alone and points every preference list at it, which buys two things. A reviewer with no Cohere account can still bring the stack up — the registry refuses to build a provider whose credential is missing (**ADR 0004**), so the shipped config cannot start without one. And the M2 load run — 20 rps for 120 s, 2400 requests — costs nothing, where the shipped config would send every one of them to a paid API because Phase 1's executor invokes candidate 1 and stops. `KEEL_CONFIG_PATH` is a plain environment variable, so putting Cohere back in the loop is an `.env` line rather than an edit.
+
+**Redis runs with `--appendonly yes` on a named volume.** ADR 0008 left this to be decided here rather than inherited from the image default. FR-3.2 wants health counters to survive a restart, and the default RDB snapshot loses the last seconds of the window on an unclean stop — which is exactly the window a breaker demo is looking at.
+
+**The gateway runs one replica and one worker process.** `MockChaosState` lives in process memory (ADR 0002), so a second of either would receive none of the chaos calls `scripts/loadgen.py` makes, and half the traffic would ignore the demo's configured error rate. §10 already records single-instance as a known limitation; this is where it becomes a constraint on the compose file.
+
+The chaos endpoint that `scripts/loadgen.py` drives is registered only when `KEEL_CHAOS_ENABLED` is set, which the compose stack does and nothing else does — see **ADR 0010**.
 
 **Repo layout:**
 
@@ -511,8 +523,13 @@ keel/
 │                          # middleware.py — gateway overhead, for S5
 │                          # logging.py — structlog config; the only module that
 │                          #   touches the root logger (§6.1)
-├── config/keel.yaml
-├── deploy/                # compose, prometheus, grafana provisioning
+├── config/keel.yaml       # the real routing config
+├── docker-compose.yml     # at the root, so bare `docker compose up` works (NFR-1, S8)
+├── deploy/
+│   ├── Dockerfile         # gateway image; build context is the repo root
+│   ├── keel.demo.yaml     # mock-only config the stack runs on — no credentials needed
+│   ├── prometheus/        # scrape config, 5s to match breaker.bucket_seconds
+│   └── grafana/           # datasource + dashboard provider, and keel-health.json
 ├── scripts/               # loadgen and other operator-facing drivers
 └── tests/
 ```

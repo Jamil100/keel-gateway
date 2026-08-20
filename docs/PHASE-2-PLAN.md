@@ -5,16 +5,16 @@
 **Last updated:** 2026-08-19
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 23.25h of 24.75h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 … P2-T5 · ⬜ P2-T6. Next up: **P2-T6 — Compose stack, Prometheus, provisioned Grafana** — the M2 exit.
+**Progress:** 27.25h of 27.25h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 … P2-T6 — **Phase 2 complete**. The M2 exit is met on every part that does not need Docker; the stack itself is written and statically checked but **unrun** — see P2-T6. Next up: **Phase 3 — the circuit breaker and capability-aware failover.**
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`; P2-T2 adds `keel/health/window.py` and `keel/redis.py`, and wires the recording call into `keel/routing/executor.py`; P2-T3 adds `keel/health/latency.py` and `keel/health/snapshot.py`, and renames `HealthWindow` to `HealthTracker` now that it records both; P2-T4 adds `keel/observability/metrics.py` and `keel/observability/middleware.py`, and the `GET /metrics` endpoint; P2-T5 adds `keel/observability/logging.py`, binds the correlation context in `keel/api/app.py`, and adds the per-attempt line to `keel/routing/executor.py`.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`; P2-T2 adds `keel/health/window.py` and `keel/redis.py`, and wires the recording call into `keel/routing/executor.py`; P2-T3 adds `keel/health/latency.py` and `keel/health/snapshot.py`, and renames `HealthWindow` to `HealthTracker` now that it records both; P2-T4 adds `keel/observability/metrics.py` and `keel/observability/middleware.py`, and the `GET /metrics` endpoint; P2-T5 adds `keel/observability/logging.py`, binds the correlation context in `keel/api/app.py`, and adds the per-attempt line to `keel/routing/executor.py`; P2-T6 adds `docker-compose.yml`, `.dockerignore`, `deploy/` (Dockerfile, `keel.demo.yaml`, Prometheus, Grafana provisioning and the board), `scripts/loadgen.py`, and the env-gated `POST /chaos/{provider}` in `keel/api/app.py`.
 
-Not yet built: the compose stack. FR-3.1, FR-3.3, and FR-7.3 are complete as of P2-T5 — outcomes, error classes, and latencies are recorded to Redis *and* exported on `/metrics`, so the health data is finally **visible** rather than merely stored. The breaker still waits for Phase 3, but the FR-3.4 precondition it was waiting on is now half met: one board (P2-T6) away from done.
+Everything Phase 2 scopes is now built. FR-3.1, FR-3.3, and FR-7.3 are complete as of P2-T5 — outcomes, error classes, and latencies are recorded to Redis *and* exported on `/metrics`, so the health data is finally **visible** rather than merely stored. The breaker still waits for Phase 3, and **the FR-3.4 precondition it was waiting on is now fully met**: health is recorded, exported, correlated in logs, and visible on a provisioned board. Phase 3 can be written against inputs somebody can watch.
 
 This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~22.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
 
@@ -24,7 +24,7 @@ Three Phase 0 exit items never landed and are folded in, sized at ~1.5h total:
 |---|---|---|
 | ~~C1~~ | ~~`.env.example` (`.gitignore` already references it)~~ | P1-T1 — ✅ **DONE** |
 | ~~C2~~ | ~~CI running the test suite (`.github/workflows/ci.yml`)~~ | P1-T1 — ✅ **DONE** |
-| C3 | `docker compose up` starts a stack | P2-T6 — deferred from P0, since nothing existed to compose until Redis and Prometheus do — ⬜ open |
+| ~~C3~~ | ~~`docker compose up` starts a stack~~ | P2-T6 — ✅ **DONE**, four services with healthchecks. Written and asserted as files; not yet run on a machine with Docker |
 
 ---
 
@@ -220,23 +220,39 @@ The 0.5h overrun is `LogSettings` and the capture harness the three bullets neve
 
 **Verified end to end against a live uvicorn with no Redis running** — the ADR 0008 case. One request produced the dropped-write warning from the untouched `keel.health.window` carrying `request_id`, `tenant`, `feature`, and `request_class`; `provider_attempt` and `request_completed` sharing that id; a 400 carrying the id from the header and correctly carrying **no** envelope fields, since it never got one. Nine JSON lines, zero malformed, and the prompt text absent from all of them. Uvicorn's own startup and access lines render as JSON through the same handler.
 
-### P2-T6 — Compose stack, Prometheus, provisioned Grafana
-**2.5h · NFR-1, S8, C3**
+### ~~P2-T6 — Compose stack, Prometheus, provisioned Grafana~~ ✅ **DONE** (with one gap, named below)
+**4.0h (est. 2.5h) · NFR-1, S8, C3**
 
-Sized 1.0h above the roadmap's 1.5h: it absorbs the Phase 0 compose carry-over (C3) and the load driver the M2 exit criterion needs but the roadmap never budgeted.
+Sized 1.0h above the roadmap's 1.5h: it absorbs the Phase 0 compose carry-over (C3) and the load driver the M2 exit criterion needs but the roadmap never budgeted. The further 1.5h is **ADR 0010**, the demo config, and `tests/test_deploy_assets.py` — none of which the bullets mention, and the first two of which the M2 exit turned out to be impossible without.
 
-- `deploy/Dockerfile` — gateway image.
-- `deploy/docker-compose.yml` — `keel-gateway:8080`, `redis:7`, `prometheus:9090`, `grafana:3000`. **No `mock-provider` container** (D-A). No `keel-worker` — that is Phase 5. Healthchecks on every service with `depends_on: condition: service_healthy`, so "up" means ready rather than started.
-- `deploy/prometheus/prometheus.yml` — scrape the gateway. Scrape interval ≤ 5s, matching the bucket width; a slower interval makes the dashboard lag the health view and the demo look sluggish.
-- `deploy/grafana/provisioning/datasources/prometheus.yml` and `.../dashboards/keel.yml` — datasource and dashboard provider as version-controlled files.
-- `deploy/grafana/dashboards/keel-health.json` — the four panels Phase 2 can actually fill: **RPS by provider · error rate by normalized class · p95 latency by provider · gateway overhead.** Anonymous viewer access on, so a reviewer is not stopped by a login prompt (S8).
-- `scripts/loadgen.py` — small async driver sending tagged traffic through the gateway at a set RPS against `mock_chaos`, with a flag to change the mock's error rate mid-run. **Open sequencing question:** that flag needs a way to reach `MockChaosState`, but the chaos API (FR-7.2) is scheduled for Phase 6. Either a minimal chaos endpoint lands early here, or loadgen sets the rate at gateway startup only. Decide when P2-T6 starts — the cheap option is a single `POST /chaos/{provider}` since the state object is already runtime-mutable and validated on assignment. This is what makes the M2 exit demonstrable, and the Phase 6 measurement run reuses it rather than reinventing it.
+**Two blockers the task card did not anticipate, found before any file was written.**
 
-The remaining three panels — circuit state timeline, failover annotations, queue depth and cost — land in Phase 6 with the full seven-panel board.
+1. **The load run would have gone to Cohere.** Every request class in `config/keel.yaml` lists `cohere_primary` first and Phase 1's executor invokes candidate 1 and stops — so `--rps 20 --duration 120` is 2400 live calls against an NFR-3 budget of EUR 75, and §5's own tripwire says to move all load generation to the mock. Verified separately that the shipped config also raises `ConfigError` with no `COHERE_API_KEY`, so a reviewer without a Cohere account could not start the stack at all, which is S8 unmet on the first command. Both are fixed by `deploy/keel.demo.yaml`, a mock-only config that compose points `KEEL_CONFIG_PATH` at: it builds a registry with **empty credentials**, and `tests/test_deploy_assets.py` asserts that property so a future edit cannot quietly reintroduce a key requirement.
+2. **Nothing could change the mock's error rate at runtime.** `build_registry` never passes a `MockChaosState`, so a running mock sits at `error_rate=0.0, latency_ms=50.0` forever and `--error-rate 0.4` had nowhere to go. Settled as **ADR 0010** — see the chaos bullet below.
+
+- ~~`deploy/Dockerfile` — gateway image.~~ ✅ `python:3.12-slim`, non-root, dependency layer separated from source. Slim rather than alpine because LiteLLM's tree carries compiled wheels that musl either rebuilds from source or fails on. **Measured: `litellm` alone is ~104 MB installed and the dependency set ~137 MB**, so the image lands near half a gigabyte — the single largest input to S8, and the reason the layer ordering is what it is. Copies `config/` and `deploy/keel.demo.yaml` explicitly, because `packages = ["keel"]` means neither is in the wheel.
+- ~~`docker-compose.yml` — `keel-gateway:8080`, `redis:7`, `prometheus:9090`, `grafana:3000` … healthchecks on every service with `depends_on: condition: service_healthy`.~~ ✅ **but at the repo root, not under `deploy/`.** NFR-1 and S8 both spell the bare command `docker compose up`, which resolves only a file in the working directory; a compose file under `deploy/` would have made the one command two requirements name into the wrong command. Everything it *reads* still lives in `deploy/`, so §8's description of that directory stays true. The gateway healthcheck runs a one-line `python` request rather than curl, which the slim image does not carry. Redis is deliberately **not** published to the host.
+- ~~`deploy/prometheus/prometheus.yml` — scrape interval ≤ 5s, matching the bucket width.~~ ✅ 5 s, and **not restated**: `tests/test_deploy_assets.py` reads `breaker.bucket_seconds` out of `config/keel.yaml` and asserts the interval still fits inside it, so the two cannot drift. No `alerting:` block — alerting is out of scope for every phase, and an empty one pointing at nothing logs a connection error every evaluation interval, in exactly the logs a reviewer reads.
+- ~~datasource and dashboard provider as version-controlled files.~~ ✅ The datasource carries a **fixed UID** (`keel-prometheus`) because the dashboard's panels reference it by UID; letting Grafana generate one would leave every panel reading "Datasource not found" — a whole broken board from one omitted field. A test asserts the declared UID and the referenced UIDs are the same set.
+- ~~`deploy/grafana/dashboards/keel-health.json` — the four panels Phase 2 can actually fill … anonymous viewer access on (S8).~~ ✅ Plus a fifth: `keel_health_writes_dropped_total`. ADR 0008's whole argument is that a clean-looking board may be clean because nothing was recorded, and that counter is the only thing that distinguishes the two — a board without it invites exactly the wrong conclusion. Rate windows are 30 s rather than 1 m, because the done-when is movement within 30 seconds; a test asserts every window still holds at least two scrapes.
+- ~~`scripts/loadgen.py` — small async driver … with a flag to change the mock's error rate mid-run.~~ ✅ **The open sequencing question is closed: the minimal chaos endpoint landed here — ADR 0010.** `POST /chaos/{provider}`, four scalars, registered *only* when `KEEL_CHAOS_ENABLED` is set. The gate is not decoration: §10 records that the gateway has no authentication of any kind, so an always-on endpoint that makes a provider fail 100% of the time is a denial-of-service control with a REST interface. Registered conditionally rather than registered-and-403ing, so the route table stays a fact about configuration and `tests/test_app.py` pins it in both directions.
+- **Beyond the bullet, and why (1): the driver paces, it does not loop.** A sequential send-and-await caps throughput at one request per round trip — about 0.33 rps against the M2 run's 3-second mock — so the requested rate would have been silently unreachable and the panels would have shown a trickle. Requests are spawned on an absolute wall-clock schedule and awaited at the end, which puts roughly `rps × latency` in flight (60 for the M2 profile) and keeps a slow spawn from pushing every later request further behind. The connection pool is sized to match, or requests queue on a socket instead of on the gateway and the achieved rate collapses without saying why.
+- **Beyond the bullet, and why (2): tenant and feature are fixed strings.** ADR 0009 caps client-supplied labels at 64 distinct values and folds the rest into `other`. A driver inventing a tenant per request would have filled the demo board with one meaningless series and taught a reviewer the opposite of what the panel is for.
+- **Beyond the bullet, and why (3): the first bound body model in the gateway.** `ChaosRequest` is it — the ingress route deliberately has none, since the payload is opaque pass-through. That made it the first thing capable of returning FastAPI's own bare validation body, which would have been a **second error shape** in a gateway whose ADR 0003 promises one body for every 4xx. A `RequestValidationError` handler now renders those in the Keel envelope at 400, matching what `_decode_body` already did by hand.
+
+The remaining three panels — circuit state timeline, failover annotations, queue depth and cost — land in Phase 6 with the full seven-panel board. Building them now would show flat lines meaning "no breaker" rather than "no trips", which is a worse lie than an absent panel; a test asserts they are absent.
 
 **Done when:** on a clean machine, `docker compose up` → `python scripts/loadgen.py --rps 20 --error-rate 0.4` → all four panels move within 30 seconds, and the whole path from clone to moving dashboard is under five minutes. **This is the M2 exit criterion.**
 
-**Phase 2 total: 13.5h** — 3.5h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1, 0.75h ADR 0008 and `keel/redis.py` in P2-T2, 0.25h the `HealthTracker` rename in P2-T3, 0.5h ADR 0009 and the label cap in P2-T4, 0.5h `LogSettings` and the capture harness in P2-T5. Under the 16.5h tripwire.
+**Met in part, and the part that is not is stated plainly.** 54 tests (597 total, 2 skipped), suite 14.1s. Everything that does not require a container is verified:
+
+- **The four panels have moving data, measured through the real stack.** `scripts/loadgen.py` was run against a live `uvicorn` on the demo config: 240 requests at 19.5 rps achieved, and `/metrics` scraped before and after shows all four panel queries moving — `keel_requests_total` split by outcome, `keel_provider_errors_total` split across **five** taxonomy classes, the duration histogram, and the overhead histogram. The observed error rate was 36.7% against a requested 40%.
+- **Overhead came back at 152 ms mean**, with no Redis running — matching P2-T4's independently measured 153 ms almost exactly, which is a useful cross-check on both. **S5 therefore remains unmeasured against a healthy stack** and is the first thing to read when the stack is run for real.
+- `tests/test_deploy_assets.py` checks the assets as files: services, ports, healthchecks, `service_healthy` dependencies, the Redis persistence flag, the build context, the `.dockerignore` rules that keep `.env` out of a layer and the demo config *in* the build, and — the one that earns its keep — **every metric name and every grouping label in the dashboard against a live `MetricsCatalogue`**. A PromQL typo renders as an empty panel, never an error, and demo day is the wrong time to find one. Three mutations confirm it bites: a typo'd metric name fails 2 tests, a typo'd label fails 1, and slowing the scrape interval to 15 s fails the bucket-width check.
+
+**The gap: Docker is not installed on the development machine** — no CLI, no daemon, no Desktop, and no local Redis, Prometheus, or Grafana. So `docker compose up` has **never been run**. Unverified, and needing a machine with Docker: that the images pull and the build succeeds, that the healthchecks pass and the `depends_on` ordering holds, that Prometheus actually reaches the gateway, that Grafana renders the board, and the **S8 cold-start timing**, which is the one number this task exists to produce. An honest 7 minutes is worth more than a restated 5.
+
+**Phase 2 total: 15.0h** — 5.0h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1, 0.75h ADR 0008 and `keel/redis.py` in P2-T2, 0.25h the `HealthTracker` rename in P2-T3, 0.5h ADR 0009 and the label cap in P2-T4, 0.5h `LogSettings` and the capture harness in P2-T5, 1.5h ADR 0010, the demo config, and `tests/test_deploy_assets.py` in P2-T6. Under the 16.5h tripwire, with 1.5h of headroom that the unrun Docker verification may yet consume.
 
 ---
 
@@ -267,7 +283,12 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | ~~Technical design §6.1 — the log line schema, the field table, and the `request_class` vs `class` split~~ ✅ | With P2-T5 |
 | ~~Technical design §8 repo layout — name `metrics.py`, `middleware.py`, and `logging.py` under `observability/`~~ ✅ | With P2-T5 |
 | ~~`.env.example` — `KEEL_LOG_LEVEL` and `KEEL_LOG_FORMAT`~~ ✅ | With P2-T5 |
-| README "Quickstart" placeholder → real commands | P2-T6 |
+| ~~`docs/adr/0010-the-chaos-endpoint-lands-early-behind-an-env-gate.md`~~ ✅ | With P2-T6 |
+| ~~Technical design §8 — compose at the repo root, the demo config, Redis persistence, single replica, and the `keel-worker` node that is still Phase 5~~ ✅ | With P2-T6 |
+| ~~Technical design §7 — the Load row names `scripts/loadgen.py`, not Locust/k6; the compose stack is not a test dependency~~ ✅ | With P2-T6 |
+| ~~README "Quickstart" placeholder → real commands~~ ✅ | P2-T6 |
+| ~~README Status → Phase 2 complete; repo-layout tree refreshed~~ ✅ | P2-T6 |
+| ~~`.env.example` — `KEEL_CHAOS_ENABLED`, and the demo-config note on `KEEL_CONFIG_PATH`~~ ✅ | With P2-T6 |
 
 The README quickstart placeholder already says to fill it in during Phase 2 — P2-T6 is where that happens. Leave the measured-results table alone: it is filled from the Phase 6 run, with real numbers or not at all.
 
@@ -279,7 +300,7 @@ The README quickstart placeholder already says to fill it in during Phase 2 — 
 |---|---|
 | Mock adapter (P1-T4) exceeds 2.0h | Freeze at current capability immediately. Top-ranked PRD risk |
 | Either phase exceeds 1.5× budget (15h / 16.5h) | Apply the roadmap §4 descope ladder rather than extending the phase |
-| ~~Tempted to add the breaker "while I'm in here"~~ — held through P2-T2 … P2-T5 | Nearly spent: `/metrics` and correlated logs both exist, so only P2-T6's board stands between here and a breaker with visible inputs |
+| ~~Tempted to add the breaker "while I'm in here"~~ — **held for the whole phase** | Spent, and it paid: metrics, correlated logs, and a provisioned board all exist, so Phase 3 is written against inputs somebody can watch. FR-3.4 satisfied in the order it asks for |
 | Cohere spend approaches €10 across Phases 1–2 | Move all load generation to `mock_chaos` — the load driver defaults there anyway |
 
 ---
@@ -313,13 +334,17 @@ Expect `200` with an `X-Keel-Provider` header. Drop any single `X-Keel-*` header
 **M2 exit — end of Phase 2:**
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d
+docker compose up -d          # at the repo root — NFR-1 and S8 both spell this command
 python scripts/loadgen.py --rps 20 --duration 120 --error-rate 0.0
 python scripts/loadgen.py --rps 20 --duration 120 --error-rate 0.4 --latency-ms 3000
 ```
+
+No `.env` and no API key are needed: compose points `KEEL_CONFIG_PATH` at the mock-only `deploy/keel.demo.yaml`, so the stack starts with no credentials and the load run costs nothing.
 
 Open Grafana at `localhost:3000`. The error-rate panel must climb to roughly 40%, split across taxonomy classes, and the p95 panel must climb toward 3s — both within about one window (60s). Confirm `curl localhost:8080/metrics` lists every metric from technical design §6.
 
 Then confirm the logs (§6.1): `docker compose logs keel-gateway` must be one JSON object per line, and picking any `request_id` out of it must bring back that request's whole story — the `provider_attempt` line and the `request_completed` line at minimum, plus any health-write warning the same request caused. No line may contain a prompt or a completion.
 
-Finally, time a cold start from `git clone` on a clean machine against the S8 five-minute target. If it misses, record the real number. An honest 7 minutes is worth more than a restated target.
+Finally, time a cold start from `git clone` on a clean machine against the S8 five-minute target. If it misses, record the real number. An honest 7 minutes is worth more than a restated target. Expect the ~137 MB dependency set — `litellm` alone is ~104 MB — to dominate it.
+
+**None of the Docker steps in this section have been run.** The machine P2-T6 was built on has no Docker, no daemon, and no local Redis, Prometheus, or Grafana, so the compose stack is written and statically asserted but never started. The two numbers still missing are the S8 cold start and **S5 against a healthy stack** — P2-T4 and P2-T6 both measured ~150 ms of overhead with Redis *down*, and single-digit milliseconds is the expectation once it is up. Whoever runs it first should record both, and treat a green `pytest` as evidence about the files rather than about the containers.

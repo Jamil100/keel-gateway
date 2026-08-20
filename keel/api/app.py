@@ -41,17 +41,21 @@ from pathlib import Path
 from typing import Any, Final, NoReturn
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, ValidationError
 from redis.asyncio import Redis
 from starlette.responses import Response
 from structlog.contextvars import bind_contextvars, clear_contextvars
 
 from keel.api.envelope import HEADER_REQUEST_ID, RequestEnvelope, build_envelope
 from keel.api.errors import (
+    ChaosUnsupportedError,
     FieldProblem,
     KeelError,
     MalformedRequestError,
     ProblemCode,
+    UnknownProviderError,
     raise_for,
     upstream_error_for,
 )
@@ -67,12 +71,20 @@ from keel.observability.middleware import (
 )
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.credentials import ProviderCredentials
+from keel.providers.mock import MockAdapter
 from keel.providers.registry import build_registry
 from keel.redis import create_redis_client
 from keel.routing.executor import Executor
 from keel.routing.router import Router
 
-__all__ = ["AppContext", "app", "create_app", "keel_error_handler"]
+__all__ = [
+    "AppContext",
+    "ChaosRequest",
+    "app",
+    "create_app",
+    "keel_error_handler",
+    "validation_error_handler",
+]
 
 logger = get_logger(__name__)
 
@@ -93,6 +105,21 @@ working.
 """
 
 STREAM_KEY: Final = "stream"
+
+CHAOS_ENABLED_ENV: Final = "KEEL_CHAOS_ENABLED"
+"""Gates the chaos endpoint. Absent or falsey means the route is never registered.
+
+Off by default because the gateway has **no authentication of any kind** (§10),
+and an always-on endpoint that injects failures into a provider is a denial of
+service with a REST interface. Compose turns it on for the demo stack, where the
+whole point is that a reviewer can break a provider themselves.
+
+Registered conditionally rather than registered-and-403ing, so the route table
+stays a fact about configuration that ``tests/test_app.py`` can assert in both
+directions.
+"""
+
+_TRUE_VALUES: Final = frozenset({"1", "true", "yes", "on"})
 
 HTTP_OK: Final = 200
 """The success status, for the log line only.
@@ -158,6 +185,64 @@ def _resolve_config_path(override: str | Path | None) -> Path:
         return Path(override)
     from_env = os.environ.get(CONFIG_PATH_ENV, "").strip()
     return Path(from_env) if from_env else DEFAULT_CONFIG_PATH
+
+
+def _resolve_chaos_enabled(override: bool | None) -> bool:
+    """Explicit argument, then ``KEEL_CHAOS_ENABLED``, then off.
+
+    Same precedence and the same blank-is-absent rule as
+    :func:`_resolve_config_path`. Read at startup rather than at import, so the
+    module-level :data:`app` does not freeze whatever the environment held when
+    Python imported this file.
+    """
+    if override is not None:
+        return override
+    return os.environ.get(CHAOS_ENABLED_ENV, "").strip().lower() in _TRUE_VALUES
+
+
+class ChaosRequest(BaseModel):
+    """The chaos knobs, all optional so a caller can set one without the rest.
+
+    Deliberately *not* :class:`MockChaosState` itself. That model has defaults for
+    every field, so binding it directly would turn "set the error rate to 0.4"
+    into "set the error rate to 0.4 and reset latency, the class mix, and the
+    seed to their defaults" — a footgun in the middle of a chaos run.
+
+    ``extra="forbid"`` so a misspelled knob is a 422 rather than a silent no-op.
+    The *value* bounds are not restated here on purpose: ``MockChaosState`` is
+    ``validate_assignment=True``, so assigning ``error_rate=5.0`` raises at the
+    assignment and this endpoint turns that into the 422. One set of bounds, in
+    the model that owns them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    error_rate: float | None = None
+    latency_ms: float | None = None
+    latency_sigma: float | None = None
+    seed: int | None = None
+
+
+def _chaos_validation_error(exc: ValidationError) -> MalformedRequestError:
+    """Turn a rejected ``MockChaosState`` assignment into the one client error body.
+
+    ``MockChaosState`` owns the bounds and enforces them on assignment, so this
+    translates rather than re-validates. pydantic's own message is carried
+    through — it already says what was wrong and what the limit was, and
+    paraphrasing it would let the two drift.
+    """
+    return MalformedRequestError(
+        "Request rejected: one or more chaos values are out of range.",
+        fields=[
+            FieldProblem(
+                field=".".join(str(part) for part in error["loc"]) or "body",
+                header=None,
+                code=ProblemCode.INVALID,
+                message=error["msg"],
+            )
+            for error in exc.errors()
+        ],
+    )
 
 
 def _json_type_name(value: object) -> str:
@@ -319,6 +404,43 @@ async def keel_error_handler(request: Request, exc: Exception) -> Response:
     return _render(exc)
 
 
+async def validation_error_handler(request: Request, exc: Exception) -> Response:
+    """Render FastAPI's own body-validation failures in the ADR 0003 envelope.
+
+    ADR 0003 promises "one machine-readable error body used by every 4xx/5xx",
+    and until now nothing tested that promise against FastAPI's *own* validator:
+    the ingress route has no body model on purpose (the payload is opaque
+    pass-through) and ``_decode_body`` hand-rolls its rejection. ``ChaosRequest``
+    is the first bound body model in the gateway, so it is the first thing that
+    could return a bare ``{"detail": [...]}`` — a second error shape, introduced
+    by accident.
+
+    Mapped to ``400`` rather than FastAPI's ``422``, matching
+    :class:`MalformedRequestError`, which is what ``_decode_body`` already
+    returns for a body that is not an object. "Your body was wrong" has one
+    status in this gateway.
+    """
+    if not isinstance(exc, RequestValidationError):  # pragma: no cover - registered per class
+        raise exc
+    return _render(
+        MalformedRequestError(
+            "Request rejected: the request body is not valid.",
+            fields=[
+                FieldProblem(
+                    # `loc` starts with "body"; keep it, so a caller can tell a
+                    # body problem from a path or query one.
+                    field=".".join(str(part) for part in error["loc"]) or "body",
+                    header=None,
+                    code=ProblemCode.INVALID,
+                    message=error["msg"],
+                )
+                for error in exc.errors()
+            ],
+            request_id=request.headers.get(HEADER_REQUEST_ID),
+        )
+    )
+
+
 def create_app(
     *,
     config_path: str | Path | None = None,
@@ -327,6 +449,7 @@ def create_app(
     credentials: ProviderCredentials | None = None,
     redis: Redis | None = None,
     metrics: MetricsCatalogue | None = None,
+    chaos_enabled: bool | None = None,
 ) -> FastAPI:
     """Build the gateway app. Does no I/O — every read happens in the lifespan.
 
@@ -341,6 +464,10 @@ def create_app(
         is supplied.
     :param metrics: a pre-built §6 catalogue. Supply one to read counters back
         in a test; otherwise the lifespan builds a fresh registry per app.
+    :param chaos_enabled: registers ``POST /chaos/{provider}`` when true. Defaults
+        to ``KEEL_CHAOS_ENABLED``, which is off unless set — the endpoint injects
+        failures and the gateway has no authentication (§10), so it is opt-in.
+        Compose enables it; `tests/test_chaos.py` passes it explicitly.
     :param redis: a pre-built client, for tests that must not touch a socket.
         When omitted the lifespan builds one from ``REDIS_URL`` and closes it on
         shutdown; an injected client is left open, because it belongs to the
@@ -436,6 +563,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.add_exception_handler(KeelError, keel_error_handler)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
 
     # Outermost by construction, so the wall clock it measures includes every
     # other layer — which is what S5 means by gateway overhead.
@@ -574,6 +702,93 @@ def create_app(
         """
         body, content_type = _context(request).metrics.render()
         return Response(content=body, media_type=content_type)
+
+    if _resolve_chaos_enabled(chaos_enabled):
+
+        @app.post("/chaos/{provider}")
+        async def chaos(provider: str, body: ChaosRequest, request: Request) -> Response:
+            """Retune a mock provider while traffic is running (an early slice of FR-7.2).
+
+            **This is Phase 6 work landing early, and ADR 0010 records why.** The
+            M2 exit criterion runs two load profiles against one gateway without
+            restarting it, and `MockChaosState` is only reachable in-process —
+            `build_registry` never passes one, so a running mock sits at
+            `error_rate=0.0, latency_ms=50` forever. Without this route
+            `loadgen --error-rate 0.4` has nowhere to put the number.
+
+            Deliberately smaller than FR-7.2 will be: no per-tenant behaviour, no
+            scheduling, no error-class mix. Four scalars, set in place.
+
+            The assignment is the validation. ``MockChaosState`` is
+            ``validate_assignment=True``, so an out-of-range value raises here and
+            becomes a 422 carrying pydantic's own message — the bounds live in one
+            place rather than being restated and allowed to drift.
+            """
+            context = _context(request)
+
+            adapter = context.registry.get(provider)
+            if adapter is None:
+                raise UnknownProviderError(
+                    f"Unknown provider {provider!r}.",
+                    fields=[
+                        FieldProblem(
+                            field="provider",
+                            header=None,
+                            code=ProblemCode.INVALID,
+                            message=(
+                                f"{provider!r} is not a configured provider; "
+                                f"known providers are {sorted(context.registry)}"
+                            ),
+                        )
+                    ],
+                )
+
+            # Chaos is a property of the mock, not of the adapter interface. A
+            # real provider cannot be told to fail 40% of the time, and pretending
+            # otherwise would give a demo a control that silently does nothing.
+            if not isinstance(adapter, MockAdapter):
+                raise ChaosUnsupportedError(
+                    f"Provider {provider!r} does not support chaos injection.",
+                    fields=[
+                        FieldProblem(
+                            field="provider",
+                            header=None,
+                            code=ProblemCode.INVALID,
+                            message=(
+                                f"{provider!r} uses the "
+                                f"{context.config.providers[provider].adapter.value!r} adapter; "
+                                f"only 'mock' providers can be retuned"
+                            ),
+                        )
+                    ],
+                )
+
+            requested = body.model_dump(exclude_none=True)
+            try:
+                for field, value in requested.items():
+                    setattr(adapter.state, field, value)
+            except ValidationError as exc:
+                raise _chaos_validation_error(exc) from exc
+
+            # Only when the caller named it: `reseed` restarts the streams even
+            # when the value is unchanged, which is what re-running the same
+            # scenario needs, and is not what a mid-run error-rate change wants.
+            if body.seed is not None:
+                adapter.reseed()
+
+            logger.info(
+                "chaos_applied",
+                provider=provider,
+                changed=sorted(requested),
+                error_rate=adapter.state.error_rate,
+                latency_ms=adapter.state.latency_ms,
+            )
+            return JSONResponse(
+                {
+                    "provider": provider,
+                    "state": adapter.state.model_dump(mode="json"),
+                }
+            )
 
     return app
 

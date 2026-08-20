@@ -697,11 +697,15 @@ def test_the_module_level_app_exists_for_uvicorn_and_reads_no_config_at_import_t
 def test_the_route_table_is_exactly_the_three_endpoints_phase_2_ships() -> None:
     """Anti-scope-creep, asserted rather than remembered.
 
-    `/metrics` arrived with P2-T4, which is why this test was written to be edited
-    rather than to survive. `/chaos` is still Phase 6 and must not appear early —
-    P2-T6 has an open question about landing a minimal chaos endpoint for
-    `loadgen`, and this is what makes that a visible decision rather than a quiet
-    one. Filtering to `APIRoute` drops FastAPI's own `/docs`, `/redoc`, and
+    `/metrics` arrived with P2-T4 and `/chaos` with P2-T6, which is why this test
+    was written to be edited rather than to survive. The default app still has
+    **three** routes: P2-T6 resolved the open sequencing question by landing a
+    minimal chaos endpoint that is registered only when `KEEL_CHAOS_ENABLED` is
+    set (ADR 0010), so an unconfigured gateway exposes no failure injector on a
+    surface that has no authentication (§10). The enabled case is asserted
+    directly below, so both directions are pinned.
+
+    Filtering to `APIRoute` drops FastAPI's own `/docs`, `/redoc`, and
     `/openapi.json`, which are plain Starlette routes and deliberately left on.
     """
     routes = {
@@ -715,6 +719,31 @@ def test_the_route_table_is_exactly_the_three_endpoints_phase_2_ships() -> None:
         ("/healthz", ("GET",)),
         ("/metrics", ("GET",)),
     }
+
+
+def test_enabling_chaos_adds_exactly_one_route(
+    base_text: str, write_config: Callable[[str], Path]
+) -> None:
+    """The other half of the pin above: opting in adds `/chaos` and nothing else.
+
+    Asserted as a set difference rather than a second literal table, so this test
+    keeps working when Phase 5 or Phase 6 adds a route and does not have to be
+    edited twice for one change.
+    """
+    path = write_config(base_text)
+    enabled = create_app(
+        config_path=path,
+        clock=ManualClock(start=1_000.0),
+        registry={},
+        credentials=CREDENTIALS,
+        redis=FakeRedis(decode_responses=True),
+        chaos_enabled=True,
+    )
+
+    def paths(app: FastAPI) -> set[str]:
+        return {route.path for route in app.routes if isinstance(route, APIRoute)}
+
+    assert paths(enabled) - paths(module_level_app) == {"/chaos/{provider}"}
 
 
 # ---- Liveness ----

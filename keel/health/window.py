@@ -1,10 +1,17 @@
 """The per-provider health window: what happened lately, kept in Redis.
 
-This is the first half of FR-3.1 and all of FR-3.2 — a rolling count of successes
-and failures-by-class per provider, persisted so a gateway restart does not reset
-the view of provider health. Latency percentiles are the other half and land in
-P2-T3's ``keel/health/latency.py``; nothing here measures time except to decide
-which bucket a count belongs in.
+FR-3.1 and FR-3.2 — a rolling record of successes and failures-by-class per
+provider, persisted so a gateway restart does not reset the view of provider
+health. The counts live here; the latency samples that ride alongside them live in
+:mod:`keel.health.latency`, and :meth:`HealthTracker.snapshot` composes the two
+into the :class:`keel.health.snapshot.ProviderHealth` Phase 3's breaker reads.
+
+**One Redis round trip per attempt, counts and samples together.** The latency
+write is *staged onto the pipeline this module already opens* rather than issued
+by a second recorder with its own connection and its own time box. Two writers
+would double the cost ADR 0008 measured when Redis is unreachable — the whole
+reason that ADR exists — and would let a bucket's count and its samples disagree
+about the same attempt.
 
 **Nothing reads this yet, and that is the point.** FR-3.4 fixes the order of
 construction: health tracking must be complete and observable before anything
@@ -34,7 +41,8 @@ outage must not read as a wall of perfectly healthy providers.
 
 Key schema is §5.5, transcribed rather than invented::
 
-    keel:health:{provider}:{bucket_epoch}  HASH  ok, err_rate_limit, ...  TTL 2xwindow
+    keel:health:{provider}:{bucket_epoch}   HASH  ok + one err_* per class  TTL 2xwindow
+    keel:latency:{provider}:{bucket_epoch}  LIST  capped latency samples    TTL 2xwindow
 
 ``{provider}`` is the config entry name (``cohere_primary``), not the adapter name
 — several entries may share one adapter, and metrics, health, and
@@ -54,6 +62,8 @@ from redis.exceptions import RedisError
 
 from keel.clock import Clock
 from keel.config import BreakerConfig
+from keel.health.latency import latency_key, parse_samples, stage_record
+from keel.health.snapshot import ProviderHealth
 from keel.providers.base import ProviderResult
 from keel.providers.errors import ErrorClass
 
@@ -62,7 +72,7 @@ __all__ = [
     "FIELD_OK",
     "HEALTH_KEY_PREFIX",
     "REDIS_TIMEOUT_SECONDS",
-    "HealthWindow",
+    "HealthTracker",
     "WindowCounts",
     "error_field",
 ]
@@ -147,8 +157,13 @@ class WindowCounts(BaseModel):
         return self.ok + sum(self.errors.values())
 
 
-class HealthWindow:
-    """Records attempt outcomes into fixed-width buckets, and merges them back."""
+class HealthTracker:
+    """Records attempt outcomes and latencies into fixed-width buckets.
+
+    Named for §5.5's own title. It was ``HealthWindow`` while it recorded only
+    counts; P2-T3 added the latency samples, and "window" now describes the
+    *range it merges over* rather than everything it holds.
+    """
 
     def __init__(self, *, redis: Redis, breaker: BreakerConfig, clock: Clock) -> None:
         self._redis = redis
@@ -179,7 +194,8 @@ class HealthWindow:
         atomicity test would pass either way. Flipping it to ``False`` breaks
         nothing in the suite, which makes this docstring the only guard there is.
         """
-        key = self._bucket_key(result.provider, self._current_bucket())
+        bucket = self._current_bucket()
+        key = self._bucket_key(result.provider, bucket)
         field = _field_for(result)
 
         try:
@@ -187,6 +203,15 @@ class HealthWindow:
                 async with self._redis.pipeline(transaction=True) as pipe:
                     pipe.hincrby(key, field, 1)
                     pipe.expire(key, self._ttl_seconds)
+                    # Staged onto the same transaction, not a second write. One
+                    # round trip, one time box, and a count that cannot survive
+                    # without its sample or the other way round.
+                    stage_record(
+                        pipe,
+                        key=latency_key(result.provider, bucket),
+                        latency_ms=result.latency_ms,
+                        ttl_seconds=self._ttl_seconds,
+                    )
                     await pipe.execute()
         except _REDIS_FAILURES as exc:
             # WARNING rather than ERROR: the request itself already succeeded or
@@ -211,11 +236,7 @@ class HealthWindow:
         outage present every provider as flawless at the moment health data
         matters most.
         """
-        current = self._current_bucket()
-        keys = [
-            self._bucket_key(provider, index)
-            for index in range(current - self._bucket_count + 1, current + 1)
-        ]
+        indices = self._window_indices()
 
         try:
             async with asyncio.timeout(REDIS_TIMEOUT_SECONDS):
@@ -224,8 +245,8 @@ class HealthWindow:
                 # landing mid-read belongs to the current bucket either way, and
                 # D3 already accepts 5 s of edge imprecision.
                 async with self._redis.pipeline(transaction=False) as pipe:
-                    for key in keys:
-                        pipe.hgetall(key)
+                    for index in indices:
+                        pipe.hgetall(self._bucket_key(provider, index))
                     buckets = await pipe.execute()
         except _REDIS_FAILURES as exc:
             logger.warning(
@@ -238,6 +259,48 @@ class HealthWindow:
 
         return _merge(provider, buckets)
 
+    async def snapshot(self, provider: str) -> ProviderHealth | None:
+        """Counts *and* percentiles over the same window. **Never raises**.
+
+        The object Phase 3's breaker reads, and the reason it exists rather than
+        the caller calling :meth:`read` and a latency read separately: §5.6
+        evaluates two trip conditions — error rate and p95 — and both must
+        describe the same instant. Two round trips could straddle a bucket
+        boundary and answer from two.
+
+        So both halves ride one pipeline: ``HGETALL`` for each bucket, then
+        ``LRANGE`` for each, issued together and split apart on the way back.
+        ``None`` means Redis could not be read, exactly as :meth:`read` does; a
+        reachable but empty window is a ``ProviderHealth`` whose ``total`` is zero
+        and whose percentiles are ``None``, which is *unknown*, not perfect.
+        """
+        indices = self._window_indices()
+
+        try:
+            async with asyncio.timeout(REDIS_TIMEOUT_SECONDS):
+                async with self._redis.pipeline(transaction=False) as pipe:
+                    for index in indices:
+                        pipe.hgetall(self._bucket_key(provider, index))
+                    for index in indices:
+                        pipe.lrange(latency_key(provider, index), 0, -1)
+                    replies = await pipe.execute()
+        except _REDIS_FAILURES as exc:
+            logger.warning(
+                "health snapshot failed for provider %r; reporting unknown: %s: %s",
+                provider,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+        # The counts were queued first and the sample lists second, so the replies
+        # split at exactly that boundary. Slicing by the index count rather than by
+        # a hard-coded 12 keeps this correct under any configured geometry.
+        split = len(indices)
+        counts = _merge(provider, replies[:split])
+        samples = parse_samples(replies[split:], provider)
+        return ProviderHealth.from_window(counts, samples)
+
     def bucket_key(self, provider: str, index: int) -> str:
         """The §5.5 key for one bucket. Public so P2-T3 and the tests agree with it."""
         return self._bucket_key(provider, index)
@@ -248,6 +311,16 @@ class HealthWindow:
 
     def _bucket_key(self, provider: str, index: int) -> str:
         return f"{HEALTH_KEY_PREFIX}:{provider}:{index}"
+
+    def _window_indices(self) -> list[int]:
+        """The bucket indices the window covers, oldest first, current included.
+
+        Shared by :meth:`read` and :meth:`snapshot` so the two cannot come to
+        disagree about what "the window" means — the failure that would let a
+        breaker read a rate over one range and a p95 over another.
+        """
+        current = self._current_bucket()
+        return list(range(current - self._bucket_count + 1, current + 1))
 
     def _current_bucket(self) -> int:
         """The floor-divided epoch *index* of the bucket covering now.

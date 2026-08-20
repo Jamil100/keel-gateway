@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fakeredis.aioredis import FakeRedis
@@ -43,12 +44,13 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 
 from keel.clock import Clock, ManualClock, SystemClock
 from keel.config import BreakerConfig, load_config
+from keel.health.latency import LATENCY_KEY_PREFIX, SAMPLE_CAP, latency_key
 from keel.health.window import (
     ERROR_FIELD_PREFIX,
     FIELD_OK,
     HEALTH_KEY_PREFIX,
     REDIS_TIMEOUT_SECONDS,
-    HealthWindow,
+    HealthTracker,
     WindowCounts,
     error_field,
 )
@@ -77,9 +79,9 @@ BREAKER = load_config(SHIPPED_CONFIG).breaker
 BUCKET_11_KEY = "keel:health:mock_chaos:11"
 
 
-def window(clock: Clock, redis: FakeRedis | None = None) -> HealthWindow:
+def window(clock: Clock, redis: FakeRedis | None = None) -> HealthTracker:
     resolved = redis if redis is not None else FakeRedis(decode_responses=True)
-    return HealthWindow(redis=resolved, breaker=BREAKER, clock=clock)
+    return HealthTracker(redis=resolved, breaker=BREAKER, clock=clock)
 
 
 def success(provider: str = PROVIDER) -> ProviderResult:
@@ -100,13 +102,29 @@ class BrokenRedis:
     """A client that refuses every command — a Redis that is down.
 
     `pipeline()` raises instead of returning a context manager, which is what a
-    connection failure looks like from `HealthWindow`'s side. A hand-written stub
+    connection failure looks like from `HealthTracker`'s side. A hand-written stub
     rather than a `Mock`, matching the fake adapters in `tests/test_executor.py`;
     subclassing a real `Redis` honestly is not worth the surface.
     """
 
     def pipeline(self, transaction: bool = True) -> object:
         raise RedisConnectionError("connection refused (test stub)")
+
+
+class CountingPipelineRedis:
+    """Delegates to a real fake, counting how many pipelines were opened.
+
+    The only way to observe decision A from outside: one write or two produce
+    identical Redis state and differ only in round trips.
+    """
+
+    def __init__(self, inner: FakeRedis) -> None:
+        self._inner = inner
+        self.pipelines = 0
+
+    def pipeline(self, transaction: bool = True) -> Any:
+        self.pipelines += 1
+        return self._inner.pipeline(transaction=transaction)
 
 
 class HangingRedis:
@@ -136,6 +154,15 @@ class HangingRedis:
         return None
 
     def hgetall(self, key: str) -> None:
+        return None
+
+    def lpush(self, key: str, value: float) -> None:
+        return None
+
+    def ltrim(self, key: str, start: int, end: int) -> None:
+        return None
+
+    def lrange(self, key: str, start: int, end: int) -> None:
         return None
 
     async def execute(self) -> list[object]:
@@ -201,7 +228,10 @@ async def test_the_key_names_the_config_entry_not_the_adapter() -> None:
 
     await window(ManualClock(start=55.0), redis).record(success(provider="cohere_primary"))
 
-    assert await redis.keys("*") == ["keel:health:cohere_primary:11"]
+    assert sorted(await redis.keys("*")) == [
+        "keel:health:cohere_primary:11",
+        "keel:latency:cohere_primary:11",
+    ], "both key families name the entry, and neither invents a suffix"
 
 
 async def test_a_bucket_expires_at_twice_the_window() -> None:
@@ -273,7 +303,9 @@ async def test_time_advancing_past_a_bucket_starts_a_new_key() -> None:
     assert sorted(await redis.keys("*")) == [
         "keel:health:mock_chaos:11",
         "keel:health:mock_chaos:12",
-    ]
+        "keel:latency:mock_chaos:11",
+        "keel:latency:mock_chaos:12",
+    ], "counts and samples roll together — they share one bucket index"
     counts = await health.read(PROVIDER)
     assert counts is not None and counts.ok == 2
 
@@ -415,7 +447,7 @@ async def test_an_empty_window_reads_as_zeros_not_none() -> None:
 
 async def test_a_read_against_a_dead_redis_is_unknown() -> None:
     """`None`, never a zero-filled window. The one that matters during an incident."""
-    health = HealthWindow(redis=BrokenRedis(), breaker=BREAKER, clock=ManualClock(start=55.0))
+    health = HealthTracker(redis=BrokenRedis(), breaker=BREAKER, clock=ManualClock(start=55.0))
 
     assert await health.read(PROVIDER) is None
 
@@ -429,7 +461,7 @@ async def test_a_write_against_a_dead_redis_is_dropped_not_raised(
     silent one — and until P2-T4 exports a counter, this line is the only evidence
     that health data is being lost.
     """
-    health = HealthWindow(redis=BrokenRedis(), breaker=BREAKER, clock=ManualClock(start=55.0))
+    health = HealthTracker(redis=BrokenRedis(), breaker=BREAKER, clock=ManualClock(start=55.0))
 
     with caplog.at_level(logging.WARNING, logger="keel.health.window"):
         await health.record(success())
@@ -450,7 +482,7 @@ async def test_a_redis_that_hangs_is_bounded_by_the_time_box() -> None:
     accepts the command and then stops answering, which without the time box would
     hang the request rather than the write.
     """
-    health = HealthWindow(redis=HangingRedis(), breaker=BREAKER, clock=SystemClock())
+    health = HealthTracker(redis=HangingRedis(), breaker=BREAKER, clock=SystemClock())
 
     started = asyncio.get_running_loop().time()
     await health.record(success())
@@ -518,12 +550,16 @@ async def test_a_different_bucket_width_changes_the_key_and_the_merge_width() ->
     )
     clock = ManualClock(start=55.0)
     redis = FakeRedis(decode_responses=True)
-    health = HealthWindow(redis=redis, breaker=breaker, clock=clock)
+    health = HealthTracker(redis=redis, breaker=breaker, clock=clock)
 
     await health.record(success())
 
-    assert await redis.keys("*") == [f"{HEALTH_KEY_PREFIX}:{PROVIDER}:5"], "55 // 10 == 5"
+    assert sorted(await redis.keys("*")) == [
+        f"{HEALTH_KEY_PREFIX}:{PROVIDER}:5",
+        f"{LATENCY_KEY_PREFIX}:{PROVIDER}:5",
+    ], "55 // 10 == 5, for both families"
     assert await redis.ttl(f"{HEALTH_KEY_PREFIX}:{PROVIDER}:5") == 60
+    assert await redis.ttl(f"{LATENCY_KEY_PREFIX}:{PROVIDER}:5") == 60
 
     clock.advance(30)
     rolled_out = await health.read(PROVIDER)
@@ -540,7 +576,7 @@ def test_the_client_carries_socket_deadlines_below_the_windows_own_box() -> None
     """The inner half of the two-layer bound, and an ordering that is load-bearing.
 
     Without socket deadlines `redis-py` takes ~4 s to give up on a refused
-    connection, so `HealthWindow`'s box fires first and every failure arrives as a
+    connection, so `HealthTracker`'s box fires first and every failure arrives as a
     bare `TimeoutError` with an empty message. Until P2-T4 exports a counter that
     log line is the only evidence health data is being dropped (ADR 0008), so an
     anonymous timeout is not evidence of anything.
@@ -570,3 +606,179 @@ def test_a_blank_redis_url_falls_back_to_the_default() -> None:
     assert RedisSettings(redis_url="redis://elsewhere:6379/1").redis_url == (
         "redis://elsewhere:6379/1"
     )
+
+
+# --------------------------------------------------------------------------
+# Latency samples ride the same write (P2-T3)
+# --------------------------------------------------------------------------
+
+
+async def test_a_recorded_attempt_leaves_its_latency_in_the_sibling_key() -> None:
+    """The literal §5.5 latency key, transcribed by hand like the health one.
+
+    Same bucket index as the count it was recorded with, which is the property
+    that lets `snapshot` merge the two over one range and mean it.
+    """
+    redis = FakeRedis(decode_responses=True)
+
+    await window(ManualClock(start=55.0), redis).record(success())
+
+    assert await redis.lrange("keel:latency:mock_chaos:11", 0, -1) == ["12.0"]
+
+
+async def test_a_failed_attempt_contributes_a_sample_too() -> None:
+    """Latency is recorded for failures, not only successes.
+
+    A provider answering every call in 50 ms with a 500 is fast and broken; one
+    that times out is slow and broken. §5.6 trips on either, so discarding the
+    failure path's latency would blind half of that.
+    """
+    redis = FakeRedis(decode_responses=True)
+
+    await window(ManualClock(start=55.0), redis).record(failure(ErrorClass.SERVER_ERROR))
+
+    assert await redis.lrange("keel:latency:mock_chaos:11", 0, -1) == ["8.0"]
+
+
+async def test_the_latency_key_expires_at_twice_the_window() -> None:
+    """TTL 2x window on the LIST as well as the HASH, or samples outlive their counts."""
+    redis = FakeRedis(decode_responses=True)
+
+    await window(ManualClock(start=55.0), redis).record(success())
+
+    assert await redis.ttl("keel:latency:mock_chaos:11") == 2 * BREAKER.window_seconds == 120
+
+
+async def test_the_count_and_the_sample_are_one_round_trip() -> None:
+    """Decision A, asserted rather than trusted: one `execute`, not two.
+
+    Two writers would mean two connections, two `asyncio.timeout` boxes, and — per
+    ADR 0008's measurement — twice the per-request cost when Redis is unreachable.
+    A counting stub is the only way to see that from outside, since the observable
+    end state is identical either way.
+    """
+    redis = FakeRedis(decode_responses=True)
+    counter = CountingPipelineRedis(redis)
+    health = HealthTracker(redis=counter, breaker=BREAKER, clock=ManualClock(start=55.0))
+
+    await health.record(success())
+
+    assert counter.pipelines == 1, "the latency write must ride the counts' pipeline"
+    assert await redis.hgetall("keel:health:mock_chaos:11") == {FIELD_OK: "1"}
+    assert await redis.lrange("keel:latency:mock_chaos:11", 0, -1) == ["12.0"]
+
+
+async def test_the_reservoir_is_capped_under_sustained_load() -> None:
+    """10 000 writes into one bucket leave exactly `SAMPLE_CAP` — the task card's bar.
+
+    This is the NFR-5 bound: memory per bucket is capped by `LTRIM` on every write
+    rather than by a sweeper that might not run. Without the trim this list grows
+    unbounded for the whole 120 s TTL.
+    """
+    redis = FakeRedis(decode_responses=True)
+    health = window(ManualClock(start=55.0), redis)
+
+    for _ in range(10_000):
+        await health.record(success())
+
+    assert await redis.llen("keel:latency:mock_chaos:11") == SAMPLE_CAP == 200
+
+
+async def test_the_survivors_of_the_cap_are_the_most_recent_samples() -> None:
+    """`LPUSH` + `LTRIM` is a recency cap, not reservoir sampling — pinned deliberately.
+
+    §5.5 calls it a "capped reservoir", but true reservoir sampling keeps an
+    unbiased sample of the whole bucket. This keeps the newest `SAMPLE_CAP`, so a
+    hot bucket's percentiles describe the tail end of its five seconds. The bias
+    is real, it leans toward newer data (which a health signal should prefer), and
+    it is asserted here so nobody reads "reservoir" and assumes otherwise.
+    """
+    redis = FakeRedis(decode_responses=True)
+    health = window(ManualClock(start=55.0), redis)
+
+    for index in range(SAMPLE_CAP + 50):
+        await health.record(
+            ProviderResult.success(
+                provider=PROVIDER, response={"id": "x"}, latency_ms=float(index)
+            )
+        )
+
+    stored = sorted(float(raw) for raw in await redis.lrange(latency_key(PROVIDER, 11), 0, -1))
+
+    assert stored == [float(i) for i in range(50, SAMPLE_CAP + 50)]
+    assert 0.0 not in stored, "the oldest samples are the ones dropped"
+
+
+async def test_samples_older_than_the_window_fall_out_of_the_snapshot() -> None:
+    """The latency half rolls on the same range as the counts."""
+    clock = ManualClock(start=0.0)
+    health = window(clock)
+    await health.record(success())
+
+    clock.advance(BREAKER.window_seconds)
+
+    snap = await health.snapshot(PROVIDER)
+    assert snap is not None
+    assert snap.sample_count == 0
+    assert snap.p95_ms is None
+
+
+# --------------------------------------------------------------------------
+# snapshot(): counts and percentiles from one read
+# --------------------------------------------------------------------------
+
+
+async def test_a_snapshot_carries_counts_and_percentiles_together() -> None:
+    """One object, one window, so §5.6 cannot read its two triggers from two instants."""
+    clock = ManualClock(start=55.0)
+    health = window(clock)
+
+    for latency in (10.0, 20.0, 30.0, 40.0):
+        await health.record(
+            ProviderResult.success(provider=PROVIDER, response={"id": "x"}, latency_ms=latency)
+        )
+    await health.record(failure(ErrorClass.RATE_LIMIT))
+
+    snap = await health.snapshot(PROVIDER)
+    assert snap is not None
+    assert (snap.ok, snap.total) == (4, 5)
+    assert snap.errors[ErrorClass.RATE_LIMIT] == 1
+    assert snap.success_rate == 0.8
+    assert snap.sample_count == 5, "the failure's latency is a sample too"
+
+
+async def test_a_snapshot_of_an_untouched_provider_is_empty_not_unknown() -> None:
+    """Redis answered, so this is real information: nothing happened."""
+    snap = await window(ManualClock(start=55.0)).snapshot("never_called")
+
+    assert snap is not None
+    assert snap.total == 0
+    assert snap.success_rate is None, "no traffic is unknown, not perfect"
+    assert (snap.p50_ms, snap.p95_ms, snap.p99_ms) == (None, None, None)
+
+
+async def test_a_snapshot_against_a_dead_redis_is_unknown() -> None:
+    """`None`, matching `read`, and for the reason ADR 0008 gives."""
+    health = HealthTracker(redis=BrokenRedis(), breaker=BREAKER, clock=ManualClock(start=55.0))
+
+    assert await health.snapshot(PROVIDER) is None
+
+
+async def test_counts_without_samples_yield_real_counts_and_no_percentiles() -> None:
+    """The third no-answer flavour, and the one easiest to get wrong.
+
+    Reachable by a count with no sibling sample — an older build's data, or a
+    partially applied pipeline. "Failing, and we do not know how slow" must not
+    collapse into "failing, and infinitely fast".
+    """
+    clock = ManualClock(start=55.0)
+    redis = FakeRedis(decode_responses=True)
+    health = window(clock, redis)
+    await redis.hincrby("keel:health:mock_chaos:11", error_field(ErrorClass.TIMEOUT), 3)
+
+    snap = await health.snapshot(PROVIDER)
+    assert snap is not None
+    assert snap.errors[ErrorClass.TIMEOUT] == 3
+    assert snap.total == 3
+    assert snap.sample_count == 0
+    assert snap.p95_ms is None, "no samples means unknown latency, never zero"

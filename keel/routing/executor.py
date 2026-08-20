@@ -12,6 +12,12 @@ carries a never-raises contract and its own time box (ADR 0008), so a Redis outa
 costs an observation rather than a request. Guarding here as well would only give
 Phase 3's breaker a guard it could forget to copy.
 
+P2-T5 adds a third thing beside those two, in the same place and for the same
+reason: one ``provider_attempt`` log line per attempt. It names no request — the
+correlation fields are bound to contextvars at ingress and merged in by
+structlog — so this module still knows nothing about HTTP, and Phase 3's several
+attempts for one request will share a ``request_id`` with no plumbing added here.
+
 **Phase 1 invokes candidate 1 and stops.** No failover, no retry, no hedging.
 A returned failure is returned, not routed around, even when its
 ``retry_elsewhere`` says another provider would be worth trying. That property
@@ -46,12 +52,33 @@ from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock
 from keel.config import KeelConfig
 from keel.health.window import HealthTracker
-from keel.observability.metrics import MetricsCatalogue
+from keel.observability.logging import get_logger
+from keel.observability.metrics import OUTCOME_ERROR, OUTCOME_OK, MetricsCatalogue
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.errors import ErrorClass, NormalizedError
 from keel.routing.router import Router
 
 __all__ = ["GATEWAY_TIMEOUT_ERROR_TYPE", "Executor"]
+
+logger = get_logger(__name__)
+"""Module-level, not a constructor dependency.
+
+``tracker`` is required and ``metrics`` is optional for the reason spelled out in
+``__init__`` below — observation must not be able to break correctness, and
+requiring a collaborator churns every existing test. A logger sits one step
+further down that scale again: structlog carries the request context in
+contextvars, so there is nothing per-request to inject and no seam worth opening.
+"""
+
+PHASE_1_ATTEMPT: Final = 1
+"""The attempt number on every line this module logs, and honest about being fixed.
+
+``execute`` invokes candidate 1 and stops, so there is no counter to read. When
+Phase 3 turns the seam below into a failover loop this becomes the loop index,
+and the log field does not change shape — a query grouping by ``attempt`` keeps
+working. Mirrors ``PHASE_1_ATTEMPTS`` in ``keel/api/app.py``, which makes the same
+promise about the ``X-Keel-Attempts`` header.
+"""
 
 # Named so a log line separates our deadline from the provider's own. A Cohere
 # timeout arrives as LiteLLM's `Timeout` and normalizes carrying that type name;
@@ -137,6 +164,30 @@ class Executor:
             # request, and a duration histogram that saw only the last one
             # would hide the slow attempt that caused the failover.
             self._metrics.observe_attempt(envelope, result)
+
+        # Same argument as the two calls above, and the same place for it: one
+        # line per attempt, not per request. `request_id`, `tenant`, `feature`,
+        # and `request_class` are not passed — ingress bound them to contextvars
+        # and `merge_contextvars` folds them into this event dict, which is what
+        # makes two attempts for one request correlate without the executor
+        # knowing anything about HTTP.
+        #
+        # No payload, no response body, ever: there is no redaction behind this
+        # (PRD §2.1), so the only safe amount to log is none.
+        logger.info(
+            "provider_attempt",
+            provider=result.provider,
+            attempt=PHASE_1_ATTEMPT,
+            outcome=OUTCOME_OK if result.ok else OUTCOME_ERROR,
+            # Distinguishes our deadline from the provider's own — the whole
+            # reason GATEWAY_TIMEOUT_ERROR_TYPE was named. "They were slow" and
+            # "we were impatient" must be answerable from one line.
+            error_class=result.error.error_class.value if result.error is not None else None,
+            provider_error_type=(
+                result.error.provider_error_type if result.error is not None else None
+            ),
+            latency_ms=round(result.latency_ms, 3),
+        )
 
         return result
 

@@ -18,8 +18,14 @@ then never accepts a request against a config it could not validate — which is
 the whole argument of ADR 0004, applied one level up: a gateway that starts
 "successfully" and fails every request is worse than one that refuses to start.
 
-**What is deliberately absent.** Structured logging is P2-T5;
-``X-Keel-Cost-Micros`` waits for the Phase 4
+**Every request is correlated from here (FR-7.3).** ``request_id`` is bound to
+contextvars from the raw header before anything can reject the request, and
+``tenant``/``feature``/``request_class`` are added as soon as the envelope exists.
+Everything below inherits them — the executor's per-attempt line, and the stdlib
+warnings from the health tracker and the error normalizer, which know nothing
+about any of this. See ``keel/observability/logging.py``.
+
+**What is deliberately absent.** ``X-Keel-Cost-Micros`` waits for the Phase 4
 cost engine, because emitting a zero would be a cost claim and a wrong one; the
 ``422`` for no capable provider (§5.7) and a real attempt count arrive with Phase
 3's failover loop; §4's ``202`` deferrable-enqueue branch is Phase 5.
@@ -38,6 +44,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from starlette.responses import Response
+from structlog.contextvars import bind_contextvars, clear_contextvars
 
 from keel.api.envelope import HEADER_REQUEST_ID, RequestEnvelope, build_envelope
 from keel.api.errors import (
@@ -51,7 +58,8 @@ from keel.api.errors import (
 from keel.clock import Clock, SystemClock
 from keel.config import DEFAULT_CONFIG_PATH, KeelConfig, load_config
 from keel.health.window import HealthTracker
-from keel.observability.metrics import MetricsCatalogue
+from keel.observability.logging import configure_logging, get_logger
+from keel.observability.metrics import OUTCOME_ERROR, OUTCOME_OK, MetricsCatalogue
 from keel.observability.middleware import (
     PROVIDER_SECONDS_ATTR,
     REQUEST_CLASS_ATTR,
@@ -65,6 +73,8 @@ from keel.routing.executor import Executor
 from keel.routing.router import Router
 
 __all__ = ["AppContext", "app", "create_app", "keel_error_handler"]
+
+logger = get_logger(__name__)
 
 CONFIG_PATH_ENV: Final = "KEEL_CONFIG_PATH"
 STATE_KEY: Final = "keel"
@@ -83,6 +93,14 @@ working.
 """
 
 STREAM_KEY: Final = "stream"
+
+HTTP_OK: Final = 200
+"""The success status, for the log line only.
+
+``KeelError.status_code`` supplies the failure statuses; the success path has no
+error object to read one from, and Starlette's default is not stated anywhere the
+log line could reach.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +255,32 @@ def _expect_response(result: ProviderResult) -> dict[str, Any]:
     return result.response
 
 
+def _log_completed(result: ProviderResult, status_code: int) -> None:
+    """One line per served request, on the success and the upstream-failure path alike.
+
+    Distinct from the executor's ``provider_attempt`` line and deliberately so:
+    §6 counts requests once while attempts may be several, and Phase 3's failover
+    loop turns that from a coincidence into a difference. The split here is what
+    keeps ``keel_requests_total`` and this line describing the same thing.
+
+    Logged on the failure branch for the same reason ``X-Keel-Provider`` is set
+    there — a 503 that will not say which provider it tried is useless in an
+    incident, and the exception handler below has no result to read a name from.
+
+    The correlation fields are absent on purpose: ingress bound them to
+    contextvars, so adding them here would duplicate what ``merge_contextvars``
+    already folds in, and the two copies could disagree.
+    """
+    logger.info(
+        "request_completed",
+        provider=result.provider,
+        attempts=PHASE_1_ATTEMPTS,
+        outcome=OUTCOME_OK if result.ok else OUTCOME_ERROR,
+        status_code=status_code,
+        error_class=result.error.error_class.value if result.error is not None else None,
+    )
+
+
 def _render(error: KeelError, headers: Mapping[str, str] | None = None) -> JSONResponse:
     """The single place a ``KeelError`` becomes bytes."""
     return JSONResponse(
@@ -261,6 +305,17 @@ async def keel_error_handler(request: Request, exc: Exception) -> Response:
     """
     if not isinstance(exc, KeelError):  # pragma: no cover - registered per class
         raise exc
+
+    # Field *names* and problem *codes* only — never the offending values, which
+    # are client input and may carry anything (PRD §2.1 rules out redaction, so
+    # the safe amount to log is none). WARNING rather than ERROR: a rejected
+    # request is the gateway working, not failing.
+    logger.warning(
+        "request_rejected",
+        status_code=exc.status_code,
+        problems=[problem.code.value for problem in exc.fields],
+        problem_fields=[problem.field for problem in exc.fields],
+    )
     return _render(exc)
 
 
@@ -297,6 +352,13 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # First, before anything that can fail. `load_config` below raises on a
+        # bad config and that exception is deliberately left to escape (NFR-4) —
+        # so the one message an operator most needs to read is emitted by a
+        # logger that has already been configured, rather than being the single
+        # line their aggregator cannot parse.
+        configure_logging()
+
         # No try/except, deliberately (NFR-4). A ConfigError raised here escapes
         # the ASGI startup event: uvicorn logs "Application startup failed" and
         # exits non-zero, and `TestClient.__enter__` re-raises it. Catching it to
@@ -397,6 +459,29 @@ def create_app(
         looks like a tightening and is a regression.
         """
         context = _context(request)
+
+        # Bound before anything that can reject the request, and from the raw
+        # header rather than the envelope, because `build_envelope` below raises
+        # on a request missing metadata and there would be no envelope to read.
+        # A 400 is exactly the line a client most needs correlated, so binding
+        # only after validation would lose the ones that matter most.
+        #
+        # `clear_contextvars` first — and it is not load-bearing today, which the
+        # code should say rather than imply. Measured: every request already
+        # starts with an empty context, because the ASGI server runs each one in
+        # its own task and a binding made inside never escapes it. Deleting this
+        # line leaves the entire suite passing.
+        #
+        # It stays for the caller that does not exist yet. Phase 5's deferred
+        # worker drains a queue in one long-lived task, where successive jobs
+        # *do* share a context, and a job inheriting the previous job's tenant
+        # would be mislabelled rather than unlabelled — wrong, and looking right.
+        # Same posture as the `transaction=True` flag in `keel/health/window.py`:
+        # a guard whose absence no test can currently detect is recorded here
+        # rather than in a test that would pass either way.
+        clear_contextvars()
+        bind_contextvars(request_id=request.headers.get(HEADER_REQUEST_ID))
+
         body = await _decode_body(request)
 
         envelope = build_envelope(
@@ -407,6 +492,16 @@ def create_app(
             config=context.config,
             clock=context.clock,
         )
+
+        # Everything below — the executor's per-attempt line, and any warning
+        # from the health tracker or the normalizer, which are stdlib loggers
+        # that know nothing about this — inherits these four fields.
+        bind_contextvars(
+            tenant=envelope.tenant,
+            feature=envelope.feature,
+            request_class=envelope.request_class,
+        )
+
         _reject_streaming(envelope)
 
         result = await context.executor.execute(envelope)
@@ -436,8 +531,10 @@ def create_app(
             error = upstream_error_for(
                 result.error, provider=result.provider, request_id=envelope.request_id
             )
+            _log_completed(result, error.status_code)
             return _render(error, headers)
 
+        _log_completed(result, HTTP_OK)
         return JSONResponse(content=_expect_response(result), headers=headers)
 
     @app.get("/healthz")

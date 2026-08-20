@@ -47,11 +47,13 @@ from pydantic import BaseModel, ConfigDict
 from keel.providers.errors import ErrorClass, NormalizedError
 
 __all__ = [
+    "ChaosUnsupportedError",
     "EnvelopeValidationError",
     "FieldProblem",
     "KeelError",
     "MalformedRequestError",
     "ProblemCode",
+    "UnknownProviderError",
     "UpstreamBadRequestError",
     "UpstreamError",
     "UpstreamRateLimitError",
@@ -167,6 +169,32 @@ class MalformedRequestError(KeelError):
 
     status_code: ClassVar[int] = 400
     code: ClassVar[str] = "invalid_request"
+
+
+class UnknownProviderError(KeelError):
+    """A route named a provider this deployment has not configured.
+
+    ``404`` rather than ``400``: the provider name is a path segment, so the
+    resource genuinely does not exist. Used by the chaos endpoint (ADR 0010);
+    nothing on the request path takes a provider from the client.
+    """
+
+    status_code: ClassVar[int] = 404
+    code: ClassVar[str] = "unknown_provider"
+
+
+class ChaosUnsupportedError(KeelError):
+    """The provider exists but is not a mock, so it cannot be retuned.
+
+    ``409`` rather than ``400`` or ``404``: the request is well-formed and the
+    resource exists — it is the provider's *state* that makes the operation
+    impossible, and no edit to the body would fix it. A real provider cannot be
+    told to fail 40% of the time, and answering ``200`` to a control that does
+    nothing would make a chaos demo silently lie (ADR 0010).
+    """
+
+    status_code: ClassVar[int] = 409
+    code: ClassVar[str] = "chaos_unsupported"
 
 
 def raise_for(problems: Sequence[FieldProblem], request_id: str | None) -> None:

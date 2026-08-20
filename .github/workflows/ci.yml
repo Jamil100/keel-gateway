@@ -47,8 +47,12 @@ jobs:
       - name: Lint
         run: ruff check .
 
+      # `scripts/` is checked too: `loadgen.py` is the operator-facing driver the
+      # M2 exit criterion runs, and it is real async code. `ruff check .` has
+      # always linted it; without this it was the one Python in the repo nothing
+      # type-checked.
       - name: Type check
-        run: mypy --strict keel
+        run: mypy --strict keel scripts
 
       - name: Test
         run: pytest -m "not real_provider"

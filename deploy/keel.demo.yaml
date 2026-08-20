@@ -1,0 +1,75 @@
+# Keel routing configuration for the compose demo stack.
+#
+# The gateway image ships `config/keel.yaml` too; this is what `docker-compose.yml`
+# points `KEEL_CONFIG_PATH` at, and the difference is deliberate on three counts.
+#
+# **It names no real provider, so the stack needs no credentials.** S8 gives a
+# reviewer five minutes from `git clone` to a moving dashboard, and NFR-1 allows
+# "no cloud dependency beyond provider API keys". A stranger with no Cohere
+# account can still bring the whole stack up and watch it work; with
+# `config/keel.yaml` they could not start it at all, because the registry refuses
+# to build a provider whose credential is missing (ADR 0004).
+#
+# **It keeps the load run free.** Every preference list in `config/keel.yaml`
+# begins with `cohere_primary`, and Phase 1's executor invokes candidate 1 and
+# stops. The M2 run is 20 rps for 120 s — 2400 live calls — against an NFR-3
+# budget of EUR 75 total. PHASE-2-PLAN §5's tripwire says to move all load
+# generation to `mock_chaos`; this is that, made structural rather than
+# remembered.
+#
+# **It leaves `config/keel.yaml` alone.** That file is the M1 milestone
+# demonstration — flip `interactive_chat.preference[0]` between two providers,
+# restart, watch `X-Keel-Provider` change. Editing it to suit the demo stack
+# would spend the milestone to save a file.
+#
+# To put Cohere back in the loop, override the path rather than editing this
+# file — set `KEEL_CONFIG_PATH=/app/config/keel.yaml` in `.env` and supply
+# `COHERE_API_KEY`. The README says so under Quickstart.
+#
+# The breaker block is copied verbatim from `config/keel.yaml` and must stay that
+# way: `deploy/prometheus/prometheus.yml` scrapes every 5 s to match
+# `bucket_seconds`, and `tests/test_deploy_assets.py` reads both files to check
+# they still agree.
+
+providers:
+  mock_chaos:
+    adapter: mock
+    # Same capability set as `config/keel.yaml`, and missing `citations` for the
+    # same reason (D2): a citations-tagged request must have somewhere it cannot
+    # go. Phase 3's capability filter is demonstrated against this gap, so the
+    # demo config must not quietly close it by being generous.
+    capabilities: [tool_use, structured_output]
+    # The mock costs nothing. These zeros are real, not placeholders.
+    pricing: { input_per_mtok: 0.0, output_per_mtok: 0.0 }
+    # No `timeout_ms`, matching `config/keel.yaml` and §5.2: the mock gets no
+    # gateway deadline. `loadgen --latency-ms 3000` drives the p95 panel toward
+    # 3 s, and a gateway timeout below that would convert the latency
+    # demonstration into a timeout demonstration.
+
+request_classes:
+  # The same three classes and the same budgets as `config/keel.yaml`, so a
+  # reviewer moving between the two files sees one difference and not four.
+  # Only `preference` changes.
+  interactive_chat:
+    deferrable: false
+    preference: [mock_chaos]
+    latency_budget_p95_ms: 4000
+    hedge: { enabled: false, after_ms: 1500 }
+  classification:
+    deferrable: false
+    preference: [mock_chaos]
+    latency_budget_p95_ms: 800
+    hedge: { enabled: true, after_ms: 400 }
+  batch_enrichment:
+    deferrable: true
+    preference: [mock_chaos]
+    latency_budget_p95_ms: 60000
+
+breaker:
+  window_seconds: 60
+  bucket_seconds: 5
+  min_requests_in_window: 20
+  error_rate_threshold: 0.30
+  open_cooldown_seconds: 30
+  half_open_probe_ratio: 0.10
+  half_open_successes_to_close: 3

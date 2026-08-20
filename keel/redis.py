@@ -40,7 +40,7 @@ CONNECT_TIMEOUT_SECONDS: Final = 0.15
 SOCKET_TIMEOUT_SECONDS: Final = 0.15
 """Socket-level deadlines, and the inner half of a two-layer bound.
 
-``HealthWindow`` wraps every call in its own 250 ms box, and these sit underneath
+``HealthTracker`` wraps every call in its own 250 ms box, and these sit underneath
 it — the same shape as the executor's ``wait_for`` sitting above the adapter's own
 timeout, and not redundant for the same reason: the inner one frees a connection,
 the outer one frees the request.
@@ -55,7 +55,7 @@ connecting to server"*. That matters more than the tenth of a second: until P2-T
 exports a counter, a log line is the **only** evidence that health data is being
 dropped (ADR 0008), and an anonymous timeout is not evidence of anything.
 
-Both must stay below ``HealthWindow.REDIS_TIMEOUT_SECONDS`` or the outer box wins
+Both must stay below ``HealthTracker.REDIS_TIMEOUT_SECONDS`` or the outer box wins
 again and the diagnosis goes back to being blank. 150 ms leaves a local Redis —
 which answers in well under a millisecond — around two orders of magnitude of
 headroom, and a false trip costs one observation, never a request.

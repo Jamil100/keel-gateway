@@ -66,14 +66,67 @@ Container architecture, request lifecycle, and component design are in [docs/TEC
 ## Quickstart
 
 ```bash
+git clone <this-repo> && cd keel
 docker compose up
 ```
 
-[PLACEHOLDER: exact commands once the compose file exists — clone URL, `.env` setup from `.env.example`, ports, the Grafana URL and default login, and the curl that sends a first request through the gateway. Fill in during Phase 2 when the compose stack lands; verify against the Phase 6 exit criteria.]
+That is the whole thing. **No API key and no `.env` are required** — the stack runs
+against `deploy/keel.demo.yaml`, which declares only the in-process mock provider
+(ADR 0002), so there is nothing to authenticate to and the load below costs nothing.
 
-[PLACEHOLDER: the chaos commands that let a reviewer break a provider themselves (FR-7.2) — fill in during Phase 6.]
+Four services come up: the gateway on **8080**, Redis, Prometheus on **9090**, and
+Grafana on **3000**. Each waits for the one below it to report *healthy*, so when
+`docker compose up` settles, the stack is ready rather than merely started.
 
-**Time to healthy dashboard:** the target is **≤ 5 minutes** on a clean machine (PRD success criterion S8). This is a design target, not a measured result.
+Open **<http://localhost:3000>** — anonymous viewer access is on, so there is no
+login prompt — and you land on **Keel — provider health**. Four panels, flat.
+
+Send one request through it:
+
+```bash
+curl -X POST localhost:8080/v1/chat/completions   -H 'X-Keel-Tenant: acme'   -H 'X-Keel-Feature: support-summary'   -H 'X-Keel-Request-Id: 00000000-0000-0000-0000-000000000001'   -H 'X-Keel-Class: interactive_chat'   -H 'Content-Type: application/json'   -d '{"model":"keel","messages":[{"role":"user","content":"hi"}]}' -i
+```
+
+`200`, with an `X-Keel-Provider` header naming who served it. Drop any single
+`X-Keel-*` header and you get a `400` listing every field that was missing.
+
+Then make the board move:
+
+```bash
+pip install -e .                       # loadgen runs on the host, not in a container
+python scripts/loadgen.py --rps 20 --duration 120 --error-rate 0.0
+python scripts/loadgen.py --rps 20 --duration 120 --error-rate 0.4 --latency-ms 3000
+```
+
+The first run drives clean traffic. The second injects a 40% failure rate and a 3-second
+median latency into the mock **while it is running** — the error-rate panel climbs to
+roughly 40%, split across the normalized error taxonomy, and the p95 panel climbs toward
+3 s. Both within about one health window.
+
+Break it yourself, at any point, without restarting anything:
+
+```bash
+curl -X POST localhost:8080/chaos/mock_chaos   -H 'Content-Type: application/json'   -d '{"error_rate": 1.0, "latency_ms": 5000}'
+```
+
+That endpoint is registered only when `KEEL_CHAOS_ENABLED` is set, which the compose
+stack does and nothing else does — it injects failures and the gateway has no
+authentication (ADR 0010).
+
+The logs are one JSON object per line and correlate by `request_id` (FR-7.3):
+
+```bash
+docker compose logs -f keel-gateway
+```
+
+**To route to Cohere instead of the mock**, put `COHERE_API_KEY=...` and
+`KEEL_CONFIG_PATH=/app/config/keel.yaml` in a `.env` at the repo root and bring the
+stack back up. Note that `config/keel.yaml` prefers Cohere for every request class, so
+a load run against it spends real money — the mock is the default for that reason.
+
+**Time to healthy dashboard:** the target is **≤ 5 minutes** on a clean machine (PRD
+success criterion S8). This is a design target, not a measured result — the number gets
+filled in from the Phase 6 measurement run.
 
 ## Measured results
 
@@ -128,9 +181,11 @@ keel/
 │   ├── health/            # window tracker, breaker
 │   ├── queue/             # deferred worker, idempotency
 │   ├── cost/              # pricing table, attribution
-│   └── observability/     # metrics, structured logging
-├── config/keel.yaml
-├── deploy/                # compose, prometheus, grafana provisioning
+│   └── observability/     # metrics exporter, overhead middleware, structured logging
+├── config/keel.yaml       # the real routing config
+├── docker-compose.yml     # at the root, so bare `docker compose up` works
+├── deploy/                # Dockerfile, demo config, prometheus, grafana provisioning
+├── scripts/               # loadgen and other operator-facing drivers
 └── tests/
 ```
 
@@ -146,7 +201,7 @@ Where the PRD and the technical design conflict, the PRD wins.
 
 ## Status
 
-**Phase 1 (milestone M1) is complete.** Phase 2 — health tracking and observability — is next.
+**Phase 2 (milestone M2) is complete.** Phase 3 — the circuit breaker and capability-aware failover — is next.
 
 What works today:
 
@@ -157,7 +212,13 @@ What works today:
 - **Startup validation.** A config that does not validate, or a provider whose credentials are absent, fails the process rather than surfacing at the first request (NFR-4, ADR 0004).
 - **`GET /healthz`** for liveness.
 
-Not built yet: the circuit breaker and failover (Phase 3), Prometheus metrics and the Grafana board (Phase 2), cost attribution (Phase 4), the deferred queue (Phase 5), and the compose stack. The quickstart below is still a placeholder because the compose file lands in Phase 2.
+- **Health tracking in Redis.** Every attempt's outcome, normalized error class, and latency is recorded into a bucketed sliding window (§5.5). A Redis that is unreachable costs an observation, never a request — the write is dropped and counted, not raised (ADR 0008).
+- **Prometheus metrics** on `GET /metrics`, the full §6 catalogue, with client-supplied labels capped so an unauthenticated caller cannot exhaust memory through a header (ADR 0009).
+- **Structured JSON logs** correlated by `request_id` across every line a request produces — including the warnings from modules that know nothing about HTTP (FR-7.3).
+- **A one-command stack**: gateway, Redis, Prometheus, and a Grafana board provisioned from version control rather than clicked together. See the quickstart above.
+- **A chaos endpoint** for retuning the mock's error rate and latency while traffic runs, off unless explicitly enabled (ADR 0010).
+
+Not built yet: the circuit breaker and failover (Phase 3), cost attribution (Phase 4), the deferred queue (Phase 5), and the remaining three dashboard panels — circuit state, failover annotations, queue depth and cost — which land in Phase 6 when something produces their metrics.
 
 Run the test suite with `pip install -e ".[dev]" && pytest` — it needs no network, no Redis, and no API key.
 

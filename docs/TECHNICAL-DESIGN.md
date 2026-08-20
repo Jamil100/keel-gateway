@@ -426,6 +426,28 @@ Computation happens *after* the response is returned to the client, to protect t
 
 The circuit state timeline is the panel the demo video is built around — it renders the trip, the flat open period, the half-open probes, and the close as one readable shape.
 
+### 6.1 Structured logs
+
+One JSON object per line on stdout, rendered by `keel/observability/logging.py` (FR-7.3). Configuration is two environment variables — `KEEL_LOG_LEVEL` (default `INFO`) and `KEEL_LOG_FORMAT`, which is `json` for deployment and `console` for a local terminal. An unrecognised value for either fails the process at startup rather than being guessed at, for the same reason an invalid routing config does (NFR-4).
+
+**Correlation is carried in contextvars, not in arguments.** `keel/api/app.py` binds `request_id` from the `X-Keel-Request-Id` header before anything can reject the request, and adds `tenant`, `feature`, and `request_class` as soon as the envelope validates. Everything below inherits them without being passed them — which is what lets the executor emit a correlated line while knowing nothing about HTTP, and what will make Phase 3's failover attempts share one key with no extra plumbing.
+
+| Field | On which lines | Source |
+|---|---|---|
+| `request_id` | every line during a request, **including rejections** | `X-Keel-Request-Id`, bound before validation |
+| `tenant`, `feature`, `request_class` | every line after the envelope validates | `RequestEnvelope` |
+| `provider`, `attempt`, `outcome`, `error_class`, `provider_error_type`, `latency_ms` | `provider_attempt` | `ProviderResult` |
+| `provider`, `attempts`, `outcome`, `status_code`, `error_class` | `request_completed` | the ingress route |
+| `status_code`, `problems`, `problem_fields` | `request_rejected` | `KeelError` — names and codes, never values |
+
+Event names are stable and few: `provider_attempt` (one per attempt, from the executor), `request_completed` (one per served request, from ingress), `request_rejected` (one per 4xx). `attempt` is fixed at `1` until Phase 3's failover loop counts for real, the same promise `X-Keel-Attempts` makes.
+
+**`request_class` here, `class` in §6.** The metric label is `class` because the table above is authoritative; the log field is `request_class` because it names the `RequestEnvelope` field. Two namespaces, and a reader moving between a log line and a PromQL query needs to know both spellings are deliberate.
+
+**The four pre-existing stdlib loggers are bridged, not rewritten.** `keel.health.window`, `keel.health.latency`, `keel.observability.metrics`, and `keel.providers.normalize` still call `logging.getLogger(__name__)`; `structlog.stdlib.ProcessorFormatter` renders their records through the same chain, so they arrive as JSON carrying the request context. That is what ADR 0008 asked for — a dropped health write now says which request lost the observation — and it keeps `keel/health/` free of any dependency on `keel/observability/`, which P2-T4 established on purpose. Third-party loggers (`httpx`, `litellm`) are held at `WARNING` unless the level is `DEBUG`, since one `INFO` line per HTTP call would double the busiest log in the system and say less than `provider_attempt` already does.
+
+**No request or response bodies are ever logged.** PRD §2.1 lists PII redaction as a non-goal, so nothing downstream would scrub a prompt and the only safe amount to log is none — not the messages, not the completion, not a truncated preview. A rejection names the offending *fields*, never their values.
+
 ---
 
 ## 7. Testing strategy
@@ -485,8 +507,10 @@ keel/
 │   ├── health/            # window tracker (counts + latency), snapshot, breaker
 │   ├── queue/             # deferred worker, idempotency
 │   ├── cost/              # pricing table, attribution
-│   └── observability/     # metrics exporter (§6 catalogue), overhead middleware,
-│                          #   structured logging
+│   └── observability/     # metrics.py — the §6 catalogue and exporter
+│                          # middleware.py — gateway overhead, for S5
+│                          # logging.py — structlog config; the only module that
+│                          #   touches the root logger (§6.1)
 ├── config/keel.yaml
 ├── deploy/                # compose, prometheus, grafana provisioning
 ├── scripts/               # loadgen and other operator-facing drivers

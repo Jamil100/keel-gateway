@@ -5,16 +5,16 @@
 **Last updated:** 2026-08-19
 **Related documents:** `PRD.md`, `TECHNICAL-DESIGN.md`, `ROADMAP.md`
 
-**Progress:** 21.75h of 23.25h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 … P2-T4 · ⬜ P2-T5, P2-T6. Next up: **P2-T5 — Structured logging.**
+**Progress:** 23.25h of 24.75h. ✅ P1-T1 … P1-T7 — **Phase 1 complete, M1 met** · ✅ P2-T1 … P2-T5 · ⬜ P2-T6. Next up: **P2-T6 — Compose stack, Prometheus, provisioned Grafana** — the M2 exit.
 Completed work is struck through and marked ✅ DONE. Unmarked items are outstanding.
 
 ---
 
 ## 0. Where the repo is, and what this covers
 
-Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`; P2-T2 adds `keel/health/window.py` and `keel/redis.py`, and wires the recording call into `keel/routing/executor.py`; P2-T3 adds `keel/health/latency.py` and `keel/health/snapshot.py`, and renames `HealthWindow` to `HealthTracker` now that it records both; P2-T4 adds `keel/observability/metrics.py` and `keel/observability/middleware.py`, and the `GET /metrics` endpoint.
+Phase 0 / M0 is complete apart from three carry-over items — ~~C1~~ and ~~C2~~ have since landed with P1-T1; only C3 remains. In place today: the three design documents, `keel/config.py` with the full pydantic schema and cross-reference validation, `tests/test_config.py` mutating the shipped `config/keel.yaml`, `pyproject.toml` with the dependency set chosen, empty package directories, and — as of P1-T1 — `keel/clock.py`, `.env.example`, and `.github/workflows/ci.yml`. P1-T2 adds `keel/api/envelope.py` and `keel/api/errors.py`; P1-T3 adds `keel/providers/base.py` and `keel/providers/errors.py`; P1-T4 adds `keel/providers/mock.py`; P1-T5 adds `keel/providers/cohere.py`, `keel/providers/credentials.py`, and `keel/providers/registry.py`; P1-T6 adds `keel/routing/router.py` and `keel/routing/executor.py`; P1-T7 adds `keel/api/app.py` and the `UpstreamError` family in `keel/api/errors.py`. P2-T1 adds `keel/providers/normalize.py`, `tests/fixtures/providers/`, and `scripts/capture_error_fixtures.py`; P2-T2 adds `keel/health/window.py` and `keel/redis.py`, and wires the recording call into `keel/routing/executor.py`; P2-T3 adds `keel/health/latency.py` and `keel/health/snapshot.py`, and renames `HealthWindow` to `HealthTracker` now that it records both; P2-T4 adds `keel/observability/metrics.py` and `keel/observability/middleware.py`, and the `GET /metrics` endpoint; P2-T5 adds `keel/observability/logging.py`, binds the correlation context in `keel/api/app.py`, and adds the per-attempt line to `keel/routing/executor.py`.
 
-Not yet built: structured logging, the compose stack. FR-3.1 and FR-3.3 are both complete as of P2-T4 — outcomes, error classes, and latencies are recorded to Redis *and* exported on `/metrics`, so the health data is finally **visible** rather than merely stored. The breaker still waits for Phase 3, but the FR-3.4 precondition it was waiting on is now half met: one board (P2-T6) away from done.
+Not yet built: the compose stack. FR-3.1, FR-3.3, and FR-7.3 are complete as of P2-T5 — outcomes, error classes, and latencies are recorded to Redis *and* exported on `/metrics`, so the health data is finally **visible** rather than merely stored. The breaker still waits for Phase 3, but the FR-3.4 precondition it was waiting on is now half met: one board (P2-T6) away from done.
 
 This document covers roadmap **Phases 1–2 (Milestones M1 and M2)**, ~22.75h at ~10h/week. Ordering is fixed by design principle 2 and FR-3.4: **observe before you react.** No breaker, no capability filter, no failover here — those are Phase 3.
 
@@ -201,14 +201,24 @@ The 0.5h overrun is **ADR 0009** and the label cap it decides. §6 specifies ele
 
 **S5, measured for the first time — and breaching.** 30 requests through the real gateway with **no Redis running**: mean overhead **153 ms**, with all 30 in the 100–250 ms bucket and **zero** under 15 ms. That is ADR 0008's predicted cost finally visible as a number rather than a paragraph — every request pays the ~150 ms Redis connect timeout, and `keel_health_writes_dropped_total{provider="mock_chaos"}` read 30. The metric is doing exactly its job by showing the breach. **S5 remains unmeasured against a healthy stack** and should be re-read in P2-T6 with Redis up, where the expectation is single-digit milliseconds.
 
-### P2-T5 — Structured logging
-**1.0h · FR-7.3**
+### ~~P2-T5 — Structured logging~~ ✅ **DONE**
+**1.5h (est. 1.0h) · FR-7.3**
 
-- `keel/observability/logging.py` — structlog, JSON to stdout, `request_id` bound once at ingress and carried through every attempt via contextvars.
-- Every line for a request carries `request_id`, `tenant`, `feature`, `request_class`, `provider`, `attempt`, `outcome`, `error_class`.
-- **Never log request or response bodies.** There is no PII redaction in v1 (PRD §8 stretch), so the safe default is to log nothing from the payload at all.
+The 0.5h overrun is `LogSettings` and the capture harness the three bullets never mention. Neither is optional in practice — see below.
 
-**Done when:** a two-attempt request emits lines sharing one `request_id`, asserted by capturing structlog output.
+- ~~`keel/observability/logging.py` — structlog, JSON to stdout, `request_id` bound once at ingress and carried through every attempt via contextvars.~~ ✅ Plus `KEEL_LOG_LEVEL` and `KEEL_LOG_FORMAT` (`json`|`console`), a `pydantic-settings` model shaped exactly like `RedisSettings`. The bullet says "JSON to stdout" and nothing about configurability, but an operator with no way to reach `DEBUG` has to edit code during an incident. A typo in either variable **fails at startup** rather than being guessed at: `logging` resolves an unknown level name to `0`, which admits every record, so `KEEL_LOG_LEVEL=INF0` would silently turn debug logging *on* in production.
+- ~~Every line for a request carries `request_id`, `tenant`, `feature`, `request_class`, `provider`, `attempt`, `outcome`, `error_class`.~~ ✅ Bound in two stages, and the split is the point: `request_id` comes from the raw header **before** anything can reject the request, and the envelope fields are added only once `build_envelope` succeeds. Binding after validation would have left every 400 uncorrelated — the one line a client quotes in a support ticket.
+- ~~**Never log request or response bodies.**~~ ✅ Pinned by a sentinel string driven through the whole HTTP path and asserted absent from the entire captured buffer, rather than per line — the failure this guards against is a future `payload=` kwarg on any of the three call sites, or a body rendered into a traceback.
+- **Beyond the bullet, and why (1): the four existing loggers are bridged, not rewritten.** ADR 0008 promised P2-T5 would put the dropped-health-write warnings "into structured JSON", and the obvious reading — convert `keel/health/window.py` to structlog — would have undone something P2-T4 built deliberately: `HealthTracker` takes a plain callback rather than a `MetricsCatalogue` precisely so `keel/health/` keeps **zero dependencies** on `keel/observability/`. `ProcessorFormatter`'s `foreign_pre_chain` carries `merge_contextvars`, so all ten stdlib lines across four modules arrive as JSON carrying the request context with **not one of those files edited**. Two of the call sites — `window._merge` and `latency.parse_samples` — are module-level functions with no instance to inject a logger into, so nothing else would have reached them anyway.
+- **Beyond the bullet, and why (2): third-party loggers are held at `WARNING`.** `httpx` emits one `INFO` line per request, so every provider call would log a second line saying less than `provider_attempt` already does — doubling the volume of the busiest log in the system. Raised back to the configured level when that level is `DEBUG`, because someone asking for debug logging is usually asking about exactly that layer.
+- **Beyond the bullet, and why (3): `configure_logging` removes only its own handler.** The lifespan calls it once per app and the suite builds thirty-odd apps, so it must be idempotent — but the obvious `root.handlers = [handler]` would throw away pytest's `caplog` handler for any test that both captures logs and builds an app. **No test does both today**, and mutation confirms all six `caplog.text` assertions still pass with the destructive version, which is exactly why the property is pinned by a test now rather than discovered when the two habits first meet.
+- **The honest gap, recorded rather than dressed up.** `clear_contextvars()` at ingress is **not load-bearing today** and the code says so. Measured: every request already starts with an empty context, because the ASGI server runs each in its own task and a binding made inside never escapes it — deleting the line leaves the whole suite green. It stays for Phase 5's deferred worker, which drains a queue in one long-lived task where successive jobs *do* share a context and a mislabelled job is worse than an unlabelled one. Same posture as the untested `transaction=True` flag in `keel/health/window.py`.
+
+**Done when:** ~~a two-attempt request emits lines sharing one `request_id`, asserted by capturing structlog output.~~ ✅ **Met, and the criterion had to be adapted honestly.** Phase 1 invokes candidate 1 and stops, and `tests/test_executor.py` *actively pins* that candidate 2 is never called — so no single request can make two attempts yet. Correlation is asserted two ways instead: two `Executor.execute` calls under one bound context (the shape Phase 3's loop will produce), and — better — one real HTTP request against a dead Redis emitting **two lines from two different modules**, the executor's `provider_attempt` and `window.py`'s dropped-write warning, sharing one `request_id`. That second one is a genuine multi-line correlation available today and is precisely the diagnostic ADR 0008 says a reviewer needs.
+
+26 tests (542 total, 2 skipped), suite 12.9s. `structlog.testing.capture_logs` is deliberately **not** the tool: in structlog 26 it clears the whole processor chain, so contextvars are invisible unless passed back explicitly, and it never sees stdlib records at all — half of what this task is about. The harness swaps a buffer under the **real** handler instead, so what is asserted is what production writes. Five mutations confirm the tests bite: dropping `merge_contextvars` fails 8, resetting `root.handlers` fails the caplog guard, logging the payload fails the sentinel test, binding after `build_envelope` fails 4, and the level validator rejects four spellings of a typo.
+
+**Verified end to end against a live uvicorn with no Redis running** — the ADR 0008 case. One request produced the dropped-write warning from the untouched `keel.health.window` carrying `request_id`, `tenant`, `feature`, and `request_class`; `provider_attempt` and `request_completed` sharing that id; a 400 carrying the id from the header and correctly carrying **no** envelope fields, since it never got one. Nine JSON lines, zero malformed, and the prompt text absent from all of them. Uvicorn's own startup and access lines render as JSON through the same handler.
 
 ### P2-T6 — Compose stack, Prometheus, provisioned Grafana
 **2.5h · NFR-1, S8, C3**
@@ -226,7 +236,7 @@ The remaining three panels — circuit state timeline, failover annotations, que
 
 **Done when:** on a clean machine, `docker compose up` → `python scripts/loadgen.py --rps 20 --error-rate 0.4` → all four panels move within 30 seconds, and the whole path from clone to moving dashboard is under five minutes. **This is the M2 exit criterion.**
 
-**Phase 2 total: 13.0h** — 3.0h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1, 0.75h ADR 0008 and `keel/redis.py` in P2-T2, 0.25h the `HealthTracker` rename in P2-T3, 0.5h ADR 0009 and the label cap in P2-T4. Under the 16.5h tripwire.
+**Phase 2 total: 13.5h** — 3.5h over the roadmap's 10.0h: 1.0h the P2-T6 carry-over, 0.5h ADR 0007 and the capture script in P2-T1, 0.75h ADR 0008 and `keel/redis.py` in P2-T2, 0.25h the `HealthTracker` rename in P2-T3, 0.5h ADR 0009 and the label cap in P2-T4, 0.5h `LogSettings` and the capture harness in P2-T5. Under the 16.5h tripwire.
 
 ---
 
@@ -254,6 +264,9 @@ Not a separate phase. Each of these ships in the same commit as the code that ma
 | ~~Technical design §6 — bucket sets, `outcome` values, the `class` spelling, the extension metric, and series priming~~ ✅ | With ADR 0009 |
 | ~~Technical design §8 repo layout — add `keel/clock.py`, `keel/api/app.py`, `scripts/`~~ ✅ | End of Phase 1 |
 | ~~README "Status" placeholder → what works today~~ ✅ (Phase 1) | End of each phase |
+| ~~Technical design §6.1 — the log line schema, the field table, and the `request_class` vs `class` split~~ ✅ | With P2-T5 |
+| ~~Technical design §8 repo layout — name `metrics.py`, `middleware.py`, and `logging.py` under `observability/`~~ ✅ | With P2-T5 |
+| ~~`.env.example` — `KEEL_LOG_LEVEL` and `KEEL_LOG_FORMAT`~~ ✅ | With P2-T5 |
 | README "Quickstart" placeholder → real commands | P2-T6 |
 
 The README quickstart placeholder already says to fill it in during Phase 2 — P2-T6 is where that happens. Leave the measured-results table alone: it is filled from the Phase 6 run, with real numbers or not at all.
@@ -266,7 +279,7 @@ The README quickstart placeholder already says to fill it in during Phase 2 — 
 |---|---|
 | Mock adapter (P1-T4) exceeds 2.0h | Freeze at current capability immediately. Top-ranked PRD risk |
 | Either phase exceeds 1.5× budget (15h / 16.5h) | Apply the roadmap §4 descope ladder rather than extending the phase |
-| ~~Tempted to add the breaker "while I'm in here"~~ — held through P2-T2, P2-T3 and P2-T4 | Nearly spent: `/metrics` now exists, so only P2-T6's board stands between here and a breaker with visible inputs |
+| ~~Tempted to add the breaker "while I'm in here"~~ — held through P2-T2 … P2-T5 | Nearly spent: `/metrics` and correlated logs both exist, so only P2-T6's board stands between here and a breaker with visible inputs |
 | Cohere spend approaches €10 across Phases 1–2 | Move all load generation to `mock_chaos` — the load driver defaults there anyway |
 
 ---
@@ -306,5 +319,7 @@ python scripts/loadgen.py --rps 20 --duration 120 --error-rate 0.4 --latency-ms 
 ```
 
 Open Grafana at `localhost:3000`. The error-rate panel must climb to roughly 40%, split across taxonomy classes, and the p95 panel must climb toward 3s — both within about one window (60s). Confirm `curl localhost:8080/metrics` lists every metric from technical design §6.
+
+Then confirm the logs (§6.1): `docker compose logs keel-gateway` must be one JSON object per line, and picking any `request_id` out of it must bring back that request's whole story — the `provider_attempt` line and the `request_completed` line at minimum, plus any health-write warning the same request caused. No line may contain a prompt or a completion.
 
 Finally, time a cold start from `git clone` on a clean machine against the S8 five-minute target. If it misses, record the real number. An honest 7 minutes is worth more than a restated target.

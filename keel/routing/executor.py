@@ -7,7 +7,7 @@ start to finish. That makes it the only honest place to record the outcome —
 decision D-C — which is why adapters know nothing about Redis and why P2-T2's
 health recording is the single line in ``execute`` below.
 
-That line is ``await``ed rather than spawned, and it cannot fail: ``HealthWindow``
+That line is ``await``ed rather than spawned, and it cannot fail: ``HealthTracker``
 carries a never-raises contract and its own time box (ADR 0008), so a Redis outage
 costs an observation rather than a request. Guarding here as well would only give
 Phase 3's breaker a guard it could forget to copy.
@@ -45,7 +45,7 @@ from typing import Final
 from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock
 from keel.config import KeelConfig
-from keel.health.window import HealthWindow
+from keel.health.window import HealthTracker
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.errors import ErrorClass, NormalizedError
 from keel.routing.router import Router
@@ -69,19 +69,19 @@ class Executor:
         config: KeelConfig,
         registry: Mapping[str, ProviderAdapter],
         clock: Clock,
-        window: HealthWindow,
+        tracker: HealthTracker,
     ) -> None:
-        # `window` is required rather than defaulting to None. An optional
+        # `tracker` is required rather than defaulting to None. An optional
         # recorder is one that can be omitted by accident, and the result would be
         # a gateway that starts cleanly, serves every request, and silently
         # records nothing — the same shape of failure ADR 0004 refuses for a
         # provider it cannot serve. Degrading when Redis is unreachable is
-        # `HealthWindow`'s job and it is unconditional, so no caller needs None.
+        # `HealthTracker`'s job and it is unconditional, so no caller needs None.
         self._router = router
         self._config = config
         self._registry = registry
         self._clock = clock
-        self._window = window
+        self._tracker = tracker
 
     async def execute(self, envelope: RequestEnvelope) -> ProviderResult:
         """Run one attempt and return its outcome, success or failure.
@@ -120,10 +120,11 @@ class Executor:
             result = self._timed_out(provider, timeout_ms, started)
 
         # One call site covering both branches above (D-C) — the whole reason
-        # adapters were kept ignorant of Redis. P2-T3 extends this to the latency
-        # reservoir, and Phase 3's breaker is the first thing that reads any of it
+        # adapters were kept ignorant of Redis. It records the outcome, the
+        # taxonomy class, and (since P2-T3) the latency sample, in one Redis
+        # round trip. Phase 3's breaker is the first thing that reads any of it
         # back; recording it here is what FR-3.4 means by observing first.
-        await self._window.record(result)
+        await self._tracker.record(result)
 
         return result
 

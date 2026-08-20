@@ -42,7 +42,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from keel.api.envelope import RequestEnvelope
 from keel.clock import Clock, ManualClock, SystemClock
 from keel.config import KeelConfig, load_config
-from keel.health.window import FIELD_OK, HealthWindow
+from keel.health.window import FIELD_OK, HealthTracker
 from keel.providers.base import ProviderAdapter, ProviderResult
 from keel.providers.credentials import ProviderCredentials
 from keel.providers.errors import ErrorClass, NormalizedError
@@ -94,22 +94,24 @@ def envelope(request_class: str = "interactive_chat") -> RequestEnvelope:
     )
 
 
-def health_window(config: KeelConfig, clock: Clock) -> HealthWindow:
+def health_tracker(config: KeelConfig, clock: Clock) -> HealthTracker:
     """A window over `fakeredis`, so the executor's recording call has somewhere to go.
 
-    Every executor now records (D-C), and `HealthWindow` is a required
+    Every executor now records (D-C), and `HealthTracker` is a required
     constructor argument precisely so a caller cannot forget to give it one. The
     tests below mostly ignore what lands in it; the ones under "What the executor
     records" are the ones that read it back.
     """
-    return HealthWindow(redis=FakeRedis(decode_responses=True), breaker=config.breaker, clock=clock)
+    return HealthTracker(
+        redis=FakeRedis(decode_responses=True), breaker=config.breaker, clock=clock
+    )
 
 
 def executor(
     config: KeelConfig,
     registry: dict[str, ProviderAdapter],
     clock: Clock | None = None,
-    window: HealthWindow | None = None,
+    tracker: HealthTracker | None = None,
 ) -> Executor:
     resolved_clock = clock if clock is not None else ManualClock()
     return Executor(
@@ -117,7 +119,7 @@ def executor(
         config=config,
         registry=registry,
         clock=resolved_clock,
-        window=window if window is not None else health_window(config, resolved_clock),
+        tracker=tracker if tracker is not None else health_tracker(config, resolved_clock),
     )
 
 
@@ -210,7 +212,7 @@ class BrokenRedis:
     """A client that refuses every command, standing in for a Redis that is down.
 
     `pipeline()` raises rather than returning a context manager, which is what a
-    connection failure looks like from `HealthWindow`'s side. Typed loosely and
+    connection failure looks like from `HealthTracker`'s side. Typed loosely and
     passed where a `Redis` is expected: `mypy --strict` covers `keel/` only, and a
     real client is far too large to subclass honestly.
     """
@@ -566,7 +568,7 @@ async def test_a_success_is_recorded_against_the_provider_that_served_it() -> No
     """The `ok` field, keyed on the config entry rather than the adapter name."""
     config = load_config(SHIPPED_CONFIG)
     clock = ManualClock(start=55.0)
-    window = health_window(config, clock)
+    window = health_tracker(config, clock)
 
     await executor(
         config,
@@ -590,7 +592,7 @@ async def test_a_returned_provider_failure_is_recorded_under_its_error_class() -
     """
     config = load_config(SHIPPED_CONFIG)
     clock = ManualClock(start=55.0)
-    window = health_window(config, clock)
+    window = health_tracker(config, clock)
 
     await executor(
         config,
@@ -617,7 +619,7 @@ async def test_a_gateway_timeout_is_recorded_even_though_no_adapter_returned(
     """
     config = load_config(write_config(base_text.replace("timeout_ms: 30000", "timeout_ms: 5", 1)))
     clock = SystemClock()
-    window = health_window(config, clock)
+    window = health_tracker(config, clock)
 
     result = await executor(
         config,
@@ -637,7 +639,7 @@ async def test_recording_lands_in_the_bucket_the_attempt_happened_in() -> None:
     config = load_config(SHIPPED_CONFIG)
     clock = ManualClock(start=55.0)
     redis = FakeRedis(decode_responses=True)
-    window = HealthWindow(redis=redis, breaker=config.breaker, clock=clock)
+    window = HealthTracker(redis=redis, breaker=config.breaker, clock=clock)
 
     await executor(
         config,
@@ -658,7 +660,7 @@ async def test_a_dead_redis_does_not_break_the_request() -> None:
     """
     config = load_config(SHIPPED_CONFIG)
     clock = ManualClock(start=55.0)
-    dead = HealthWindow(redis=BrokenRedis(), breaker=config.breaker, clock=clock)
+    dead = HealthTracker(redis=BrokenRedis(), breaker=config.breaker, clock=clock)
 
     result = await executor(
         config,

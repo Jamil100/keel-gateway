@@ -1,0 +1,43 @@
+# Prometheus scrape configuration, version-controlled rather than hand-configured
+# (TECHNICAL-DESIGN §8).
+#
+# One job: the gateway. There is no `mock-provider` to scrape (ADR 0002) and no
+# `keel-worker` until Phase 5.
+
+global:
+  # 5 s, matching `breaker.bucket_seconds` in `config/keel.yaml` and
+  # `deploy/keel.demo.yaml`. The health window rolls in 5-second buckets, so a
+  # slower scrape would make the dashboard lag the gateway's own view of health
+  # and the demo look sluggish — and a Phase 3 breaker trip could come and go
+  # between two samples.
+  #
+  # `tests/test_deploy_assets.py` reads this value and the config's bucket width
+  # and asserts they still agree, so the two cannot drift apart silently.
+  scrape_interval: 5s
+  # Equal to the interval: with a 30 s rate window (the dashboard's choice) there
+  # is no value in evaluating less often than the data arrives.
+  evaluation_interval: 5s
+  external_labels:
+    stack: keel-demo
+
+# No alerting rules and no Alertmanager. Alerting is not in scope for any phase
+# of this project — the dashboard and the demo video are the output — and an
+# empty `alerting:` block that points at nothing produces a connection error
+# every evaluation interval, which is noise in exactly the logs a reviewer reads.
+
+scrape_configs:
+  - job_name: keel-gateway
+    # The compose service name. Inside the compose network this resolves to the
+    # gateway container; from the host it would be localhost:8080.
+    static_configs:
+      - targets: ["keel-gateway:8080"]
+        labels:
+          service: keel-gateway
+    metrics_path: /metrics
+    # Unauthenticated and on the main port, which is what every document
+    # describing it says and what the M2 verification command assumes
+    # (`curl localhost:8080/metrics`). The gateway has no authentication at all
+    # (§10), so there is nothing to configure here.
+    scheme: http
+    # Shorter than the interval, so a hung gateway cannot stall the scrape loop.
+    scrape_timeout: 4s

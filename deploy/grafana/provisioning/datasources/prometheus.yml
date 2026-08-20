@@ -1,0 +1,26 @@
+# The Prometheus datasource, provisioned as a file so nobody has to add it by
+# hand (TECHNICAL-DESIGN §8: "a reviewer who has to build panels themselves will
+# not").
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # A fixed UID, because `deploy/grafana/dashboards/keel-health.json` refers to
+    # this datasource by UID. Letting Grafana generate one would make every panel
+    # in that file point at a datasource that does not exist, which renders as
+    # "Datasource not found" on all four.
+    uid: keel-prometheus
+    # The compose service name on the compose network.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Matches the scrape interval in `deploy/prometheus/prometheus.yml`. Grafana
+      # uses this to compute `$__rate_interval`, and a value that disagrees with
+      # the real interval produces rate windows too short to hold two samples —
+      # which renders as gaps in a graph that is actually being scraped fine.
+      timeInterval: 5s
+      httpMethod: POST

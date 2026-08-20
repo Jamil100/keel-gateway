@@ -1,0 +1,22 @@
+# The dashboard provider: load every JSON file in the mounted directory.
+#
+# Provisioned rather than imported through the UI, so the board a reviewer sees
+# is the board in version control. `allowUiUpdates: false` means a change made in
+# the browser cannot silently become the thing that ships — edits go through the
+# JSON file and a diff.
+
+apiVersion: 1
+
+providers:
+  - name: keel
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    # Grafana rescans on this interval, so editing the JSON while the stack is up
+    # reloads the board without a restart.
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

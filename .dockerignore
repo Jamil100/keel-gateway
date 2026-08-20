@@ -1,0 +1,67 @@
+# What never needs to reach the build context.
+#
+# The context is the repo root (see `deploy/Dockerfile`), and every byte of it is
+# sent to the daemon before the first instruction runs. That transfer is inside
+# S8's five-minute cold-start budget, so this file is a performance control
+# rather than housekeeping — `.git/` alone is usually larger than the source.
+#
+# It is also a safety control: `.env` holds a real provider credential, and
+# without the rule below a `COPY . .` in any future edit of the Dockerfile would
+# bake it into a layer. The Dockerfile copies named paths today; this makes that
+# a defence in depth rather than the only thing standing between a key and an
+# image.
+
+# Credentials. `.env.example` is committed and carries no secret; `.env` does.
+.env
+.env.*
+!.env.example
+
+# Version control and CI
+.git
+.gitignore
+.github
+
+# Not used at runtime. Tests run on the host (NFR-2 — no network, no Redis), and
+# the compose stack is not a test dependency.
+tests/
+docs/
+scripts/
+measurements/
+
+# The compose stack itself, and the provisioning the other services bind-mount
+# rather than the gateway image carrying. `deploy/keel.demo.yaml` IS copied — it
+# is named explicitly in the Dockerfile, and an ignore rule here would break that
+# COPY, so the directory is not excluded wholesale.
+docker-compose.yml
+deploy/prometheus/
+deploy/grafana/
+
+# Tooling caches and build artefacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments — a local .venv can be hundreds of megabytes and is never useful
+# inside the image.
+.venv/
+venv/
+env/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

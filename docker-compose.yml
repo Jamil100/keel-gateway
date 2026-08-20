@@ -1,0 +1,166 @@
+# The whole stack: gateway, Redis, Prometheus, Grafana.
+#
+#     docker compose up
+#
+# **At the repo root rather than under `deploy/`, deliberately.** NFR-1 and PRD
+# success criterion S8 both spell that bare command, and `docker compose` only
+# resolves a file in the working directory. Everything this file *reads* lives in
+# `deploy/`, so TECHNICAL-DESIGN §8's "deploy/ — compose, prometheus, grafana
+# provisioning" still describes where the configuration is; only the entrypoint
+# moved, so that the documented command is the one that works.
+#
+# **No `mock-provider` container** — the mock is an in-process adapter (ADR 0002),
+# which is also one fewer image pull against the S8 budget. **No `keel-worker`** —
+# the deferred queue is Phase 5. §8's diagram draws it because it draws the end
+# state; this file is what exists.
+#
+# Every service has a healthcheck and every dependency waits on
+# `condition: service_healthy`, so "up" means ready rather than started. Without
+# that, Grafana can come up before Prometheus and provision a datasource it
+# cannot reach, which shows up as four empty panels and looks like a broken
+# dashboard rather than a race.
+
+name: keel
+
+services:
+  keel-gateway:
+    build:
+      # The repo root, not `deploy/` — the image needs `pyproject.toml`,
+      # `keel/`, and `config/`. `.dockerignore` keeps the context small.
+      context: .
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # The mock-only config, so the stack starts with no credentials at all and
+      # the load run costs nothing. To put Cohere back in the loop, set
+      # KEEL_CONFIG_PATH=/app/config/keel.yaml in `.env` and supply
+      # COHERE_API_KEY — see the README.
+      KEEL_CONFIG_PATH: /app/deploy/keel.demo.yaml
+      # Inside compose the host is the service name, not localhost — the note
+      # `.env.example` has carried since P1-T1.
+      REDIS_URL: redis://redis:6379/0
+      KEEL_LOG_FORMAT: json
+      KEEL_LOG_LEVEL: INFO
+      # Registers POST /chaos/{provider} (ADR 0010). Off by default everywhere
+      # else: the gateway has no authentication (§10), and this endpoint injects
+      # failures. On here because breaking a provider yourself is the demo.
+      KEEL_CHAOS_ENABLED: "true"
+    env_file:
+      # Optional, so `docker compose up` works on a clean clone with no `.env`.
+      # This is the file that carries COHERE_API_KEY when someone wants the real
+      # provider; the demo config does not need it.
+      - path: .env
+        required: false
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # `/healthz` touches no config, no registry, no provider, and no Redis, and
+      # that restraint is why it is safe here: this healthcheck restarts the
+      # container when it fails, so a probe with dependencies would turn a
+      # provider outage into a restart loop (ADR 0008).
+      #
+      # Python rather than curl or wget — the slim base image has neither, and
+      # installing one to run a healthcheck is 20 MB for a one-line request.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz',timeout=3).status==200 else 1)
+      interval: 5s
+      timeout: 4s
+      # Generous, because the first start imports LiteLLM, which costs several
+      # seconds on its own. A tight window here reads as a crash loop on a slow
+      # machine — precisely the machine S8 cares about.
+      start_period: 40s
+      retries: 5
+    restart: unless-stopped
+    # Deliberately not scaled. `MockChaosState` lives in process memory
+    # (ADR 0002), so a second replica would receive none of loadgen's chaos calls
+    # and half the traffic would ignore the demo's error rate. §10 records
+    # single-instance as a known limitation; this is where it becomes concrete.
+
+  redis:
+    image: redis:7-alpine
+    # ADR 0008 asked P2-T6 to state the persistence mode rather than inherit the
+    # image default, and this is that statement. FR-3.2 wants health counters to
+    # survive a restart; with the default (RDB snapshots only) the last seconds
+    # of a window are lost on an unclean stop, which is exactly the window a
+    # breaker demo is looking at. AOF costs a little disk and nothing noticeable
+    # in latency at this volume.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      # A named volume, not a bind mount: nothing in `.gitignore` covers Redis or
+      # Grafana state, so a bind mount would put runtime files in `git status`.
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 24h is far more than the demo needs and keeps the volume small. The
+      # measured Phase 6 run captures its numbers rather than relying on
+      # retention.
+      - --storage.tsdb.retention.time=24h
+      - --web.enable-lifecycle
+    depends_on:
+      keel-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      # Anonymous viewer access, so a reviewer reaches the board without a login
+      # prompt (S8). Viewer specifically — read the panels, change nothing.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_BASIC_ENABLED: "false"
+      # Straight to the board rather than to an empty home page. The UID is
+      # fixed in `keel-health.json` so this link cannot rot.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/keel-health.json
+      # Nothing to phone home about on a demo stack.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      # Provisioned from version control, not clicked together — §8 is explicit
+      # that "a reviewer who has to build panels themselves will not".
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
